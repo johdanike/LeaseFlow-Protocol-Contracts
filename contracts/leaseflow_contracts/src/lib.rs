@@ -1,24 +1,78 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, String};
+use soroban_sdk::{
+    contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, 
+    Address, Env, String, Symbol, BytesN
+};
+
+// Re-export the pure math function so contract callers and tests can use it.
+// pub use leaseflow_math::calculate_total_cost; // Only if available in dependencies
+
+macro_rules! require {
+    ($condition:expr, $error_msg:expr) => {
+        if !$condition {
+            panic!($error_msg);
+        }
+    };
+}
+
+// ── Rate helpers ──────────────────────────────────────────────────────────────
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum LeaseStatus {
-    Active,
-    Expired,
+pub enum RateType {
+    PerSecond,
+    PerHour,
+    PerDay,
+}
+
+pub fn to_per_second(rate: i128, rate_type: RateType) -> i128 {
+    match rate_type {
+        RateType::PerSecond => rate,
+        RateType::PerHour   => rate / 3_600,
+        RateType::PerDay    => rate / 86_400,
+    }
+}
+
+pub const SECS_PER_UNIT: u64 = 86_400;
+
+// ── Status Enums ──────────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DepositStatus {
+    Held,
+    Settled,
     Disputed,
 }
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Lease {
+pub enum LeaseStatus {
+    Pending,
+    Active,
+    Expired,
+    Disputed,
+    Terminated,
+}
+
+// ── Structs ───────────────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeaseInstance {
     pub landlord: Address,
     pub tenant: Address,
     pub rent_amount: i128,
     pub deposit_amount: i128,
     pub start_date: u64,
     pub end_date: u64,
+    pub property_uri: String,
     pub status: LeaseStatus,
+    pub nft_contract: Option<Address>,
+    pub token_id: Option<u128>,
+    pub active: bool,
+    pub rent_paid: i128,
+    pub debt: i128,
 }
 
 #[contracttype]
@@ -30,12 +84,75 @@ pub struct Receipt {
     pub date: u64,
 }
 
-#[contract]
-pub struct LeaseContract;
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeaseAmendment {
+    pub new_rent_amount: Option<i128>,
+    pub new_end_date: Option<u64>,
+    pub landlord_signature: BytesN<32>,
+    pub tenant_signature: BytesN<32>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DepositReleasePartial {
+    pub tenant_amount: i128,
+    pub landlord_amount: i128,
+}
+
+#[contracttype]
+pub enum DepositRelease {
+    FullRefund,
+    PartialRefund(DepositReleasePartial),
+    Disputed,
+}
+
+// ── Events ────────────────────────────────────────────────────────────────────
+
+#[contractevent]
+pub struct LeaseTerminated {
+    pub lease_id: Symbol,
+}
+
+// ── Storage Keys ──────────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DataKey {
+    Lease(Symbol),
+    Receipt(Symbol, u32),
+    Admin,
+}
+
+// ── Storage Helpers ───────────────────────────────────────────────────────────
 
 const DAY_IN_LEDGERS: u32 = 17280; // Assuming 5s ledger time
 const MONTH_IN_LEDGERS: u32 = DAY_IN_LEDGERS * 30;
 const YEAR_IN_LEDGERS: u32 = DAY_IN_LEDGERS * 365;
+
+pub fn load_lease(env: &Env, lease_id: &Symbol) -> Option<LeaseInstance> {
+    env.storage().persistent().get(&DataKey::Lease(lease_id.clone()))
+}
+
+pub fn save_lease(env: &Env, lease_id: &Symbol, lease: &LeaseInstance) {
+    let key = DataKey::Lease(lease_id.clone());
+    env.storage().persistent().set(&key, lease);
+    // identities stored in Persistent storage to survive ledger expirations
+    env.storage().persistent().extend_ttl(&key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+}
+
+mod nft_contract {
+    use soroban_sdk::{contractclient, Address, Env};
+    #[contractclient(name = "NftClient")]
+    pub trait NftInterface {
+        fn transfer_from(env: Env, spender: Address, from: Address, to: Address, token_id: u128);
+    }
+}
+
+// ── Contract Implementation ───────────────────────────────────────────────────
+
+#[contract]
+pub struct LeaseContract;
 
 #[contractimpl]
 impl LeaseContract {
@@ -47,42 +164,40 @@ impl LeaseContract {
         tenant: Address,
         rent_amount: i128,
         deposit_amount: i128,
-        duration_seconds: u64,
+        duration: u64,
+        property_uri: String,
     ) -> bool {
         landlord.require_auth();
 
         let start_date = env.ledger().timestamp();
-        let end_date = start_date.saturating_add(duration_seconds);
+        let end_date = start_date.saturating_add(duration);
 
-        let lease = Lease {
+        let lease = LeaseInstance {
             landlord,
             tenant,
             rent_amount,
             deposit_amount,
             start_date,
             end_date,
-            status: LeaseStatus::Active,
+            property_uri,
+            status: LeaseStatus::Pending,
+            nft_contract: None,
+            token_id: None,
+            active: true,
+            rent_paid: 0,
+            debt: 0,
         };
 
-        // Core identity and contract terms stored in PERSISTENT storage to survive ledger expirations
-        let key = (symbol_short!("lease"), lease_id.clone());
-        env.storage().persistent().set(&key, &lease);
-        
-        // Initial TTL extension for core data to live for at least the lease duration (approx 1 year)
-        env.storage().persistent().extend_ttl(&key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
-
+        save_lease(&env, &lease_id, &lease);
         true
     }
 
     /// Processes rent payment, saves receipt in Instance storage, and extends TTL.
     pub fn pay_rent(env: Env, lease_id: Symbol, month: u32, amount: i128) -> bool {
-        let key = (symbol_short!("lease"), lease_id.clone());
-        let lease: Lease = env.storage().persistent().get(&key).expect("Lease not found");
-        
+        let mut lease = load_lease(&env, &lease_id).expect("Lease not found");
         lease.tenant.require_auth();
 
-        // Individual monthly payment receipts use INSTANCE storage to keep costs lower 
-        // as they are accessed primarily during active lease management
+        // Monthly payment receipts use Instance storage to keep costs low
         let receipt = Receipt {
             lease_id: lease_id.clone(),
             month,
@@ -90,35 +205,38 @@ impl LeaseContract {
             date: env.ledger().timestamp(),
         };
         
-        let receipt_key = (symbol_short!("receipt"), lease_id.clone(), month);
-        env.storage().instance().set(&receipt_key, &receipt);
+        env.storage().instance().set(&DataKey::Receipt(lease_id.clone(), month), &receipt);
 
-        // Auto-extend TTL of the contract instance and its data during payment
-        // This keeps the contract "alive" for the duration of the 12-month lease 
-        // without manual "rent" payments to the network
+        lease.rent_paid += amount;
+        save_lease(&env, &lease_id, &lease);
+
+        // Keep the contract "alive" for the duration of the lease
         env.storage().instance().extend_ttl(MONTH_IN_LEDGERS, YEAR_IN_LEDGERS);
         
-        // Also extend the persistent lease record TTL to ensure core data persists
-        env.storage().persistent().extend_ttl(&key, MONTH_IN_LEDGERS, YEAR_IN_LEDGERS);
-
         true
     }
 
-    /// Returns the lease details from Persistent storage.
-    pub fn get_lease(env: Env, lease_id: Symbol) -> Lease {
-        let key = (symbol_short!("lease"), lease_id);
-        env.storage().persistent().get(&key).expect("Lease not found")
+    pub fn get_lease(env: Env, lease_id: Symbol) -> LeaseInstance {
+        load_lease(&env, &lease_id).expect("Lease not found")
     }
 
-    /// Returns a specific receipt from Instance storage.
     pub fn get_receipt(env: Env, lease_id: Symbol, month: u32) -> Receipt {
-        let key = (symbol_short!("receipt"), lease_id, month);
-        env.storage().instance().get(&key).expect("Receipt not found")
+        env.storage()
+            .instance()
+            .get(&DataKey::Receipt(lease_id, month))
+            .expect("Receipt not found")
     }
-    
-    /// Triggered to keep the contract instance and state alive manually if needed.
+
+    pub fn activate_lease(env: Env, lease_id: Symbol, tenant: Address) -> bool {
+        let mut lease = load_lease(&env, &lease_id).expect("Lease not found");
+        require!(lease.tenant == tenant, "Unauthorized");
+        lease.status = LeaseStatus::Active;
+        save_lease(&env, &lease_id, &lease);
+        true
+    }
+
     pub fn extend_ttl(env: Env, lease_id: Symbol) {
-        let key = (symbol_short!("lease"), lease_id);
+        let key = DataKey::Lease(lease_id);
         if env.storage().persistent().has(&key) {
             env.storage().persistent().extend_ttl(&key, MONTH_IN_LEDGERS, YEAR_IN_LEDGERS);
         }
