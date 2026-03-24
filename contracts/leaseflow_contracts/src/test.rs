@@ -1,6 +1,10 @@
 #![cfg(test)]
 
 use super::*;
+use soroban_sdk::{
+    testutils::{Address as _, Events, Ledger},
+    Address, Env, Event, String, Symbol,
+};
 use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Address, Env, symbol_short};
 use crate::{LeaseContract, LeaseContractClient, LeaseStatus};
 
@@ -57,6 +61,429 @@ fn test_storage_management_and_ttl() {
 }
 
 #[test]
+fn test_terminate_lease_before_end_date_fails() {
+    // Arrange
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    seed_lease(&env, &id, LEASE_ID, &make_lease(&env, &landlord, &tenant));
+    env.ledger().with_mut(|l| l.timestamp = END - 1); // still active
+
+    // Act
+    let result = client.try_terminate_lease(&LEASE_ID, &landlord);
+
+    // Assert
+    assert_eq!(result, Err(Ok(LeaseError::LeaseNotExpired)));
+}
+
+/// Returns RentOutstanding when rent has not been paid through end_date.
+#[test]
+fn test_terminate_lease_with_outstanding_rent_fails() {
+    // Arrange
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.rent_paid_through = END - 1; // one second short
+    seed_lease(&env, &id, LEASE_ID, &lease);
+    env.ledger().with_mut(|l| l.timestamp = END + 1);
+
+    // Act
+    let result = client.try_terminate_lease(&LEASE_ID, &landlord);
+
+    // Assert
+    assert_eq!(result, Err(Ok(LeaseError::RentOutstanding)));
+}
+
+/// Returns DepositNotSettled when deposit is still Held.
+#[test]
+fn test_terminate_lease_with_unsettled_deposit_fails() {
+    // Arrange
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.deposit_status = DepositStatus::Held;
+    seed_lease(&env, &id, LEASE_ID, &lease);
+    env.ledger().with_mut(|l| l.timestamp = END + 1);
+
+    // Act
+    let result = client.try_terminate_lease(&LEASE_ID, &landlord);
+
+    // Assert
+    assert_eq!(result, Err(Ok(LeaseError::DepositNotSettled)));
+}
+
+/// Returns DepositNotSettled when deposit is Disputed.
+#[test]
+fn test_terminate_lease_with_disputed_deposit_fails() {
+    // Arrange
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.deposit_status = DepositStatus::Disputed;
+    seed_lease(&env, &id, LEASE_ID, &lease);
+    env.ledger().with_mut(|l| l.timestamp = END + 1);
+
+    // Act
+    let result = client.try_terminate_lease(&LEASE_ID, &landlord);
+
+    // Assert
+    assert_eq!(result, Err(Ok(LeaseError::DepositNotSettled)));
+}
+
+/// Returns Unauthorised for a caller that is neither landlord, tenant, nor admin.
+#[test]
+fn test_terminate_lease_unauthorised_caller_fails() {
+    // Arrange
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let stranger = Address::generate(&env);
+
+    seed_lease(&env, &id, LEASE_ID, &make_lease(&env, &landlord, &tenant));
+    env.ledger().with_mut(|l| l.timestamp = END + 1);
+
+    // Act
+    let result = client.try_terminate_lease(&LEASE_ID, &stranger);
+
+    // Assert
+    assert_eq!(result, Err(Ok(LeaseError::Unauthorised)));
+}
+
+/// Returns LeaseNotFound for a non-existent lease ID.
+#[test]
+fn test_terminate_lease_not_found_fails() {
+    // Arrange
+    let env = make_env();
+    let (_, client) = setup(&env);
+    let caller = Address::generate(&env);
+    env.ledger().with_mut(|l| l.timestamp = END + 1);
+
+    // Act — no lease stored
+    let result = client.try_terminate_lease(&99u64, &caller);
+
+    // Assert
+    assert_eq!(result, Err(Ok(LeaseError::LeaseNotFound)));
+}
+
+/// Confirms the lease.terminated event is published on successful termination.
+#[test]
+fn test_terminate_lease_emits_terminated_event() {
+    // Arrange
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    seed_lease(&env, &id, LEASE_ID, &make_lease(&env, &landlord, &tenant));
+    env.ledger().with_mut(|l| l.timestamp = END + 1);
+
+    // Act
+    client.terminate_lease(&LEASE_ID, &landlord);
+
+    // Assert — the LeaseTerminated event must have been emitted.
+    let expected = LeaseTerminated { lease_id: LEASE_ID };
+    assert_eq!(
+        env.events().all(),
+        std::vec![expected.to_xdr(&env, &id)],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// NFT Escrow Tests
+// ---------------------------------------------------------------------------
+
+/// Mock NFT contract for testing
+#[contractclient(name = "MockNftClient")]
+pub trait MockNftInterface {
+    fn transfer_from(env: Env, spender: Address, from: Address, to: Address, token_id: u128);
+    fn owner_of(env: Env, token_id: u128) -> Address;
+}
+
+/// Test that create_lease_with_nft transfers NFT to contract escrow
+#[test]
+fn test_create_lease_with_nft_escrows_to_contract() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let nft_contract = Address::generate(&env);
+    let token_id: u128 = 123;
+    
+    // Register mock NFT contract
+    let nft_client = MockNftClient::new(&env, &nft_contract);
+    
+    // Create lease with NFT
+    let lease_id = symbol_short!("test_lease");
+    let result = client.create_lease_with_nft(
+        &lease_id,
+        &landlord,
+        &tenant,
+        &1000i128,
+        &RateType::PerDay,
+        &86400u64, // 1 day duration
+        &2000u64,  // grace period
+        &100i128,  // late fee flat
+        &50i128,   // late fee amount
+        &RateType::PerDay,
+        &nft_contract,
+        &token_id,
+    );
+    
+    assert_eq!(result, symbol_short!("created"));
+    
+    // Verify usage rights were granted to tenant
+    let usage_rights = client.check_usage_rights(&nft_contract, &token_id, &tenant);
+    assert!(usage_rights.is_some());
+    
+    let rights = usage_rights.unwrap();
+    assert_eq!(rights.renter, tenant);
+    assert_eq!(rights.nft_contract, nft_contract);
+    assert_eq!(rights.token_id, token_id);
+    assert_eq!(rights.lease_id, lease_id);
+}
+
+/// Test that end_lease transfers NFT back to landlord and removes usage rights
+#[test]
+fn test_end_lease_returns_nft_to_landlord() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let nft_contract = Address::generate(&env);
+    let token_id: u128 = 456;
+    
+    // Create lease with NFT first
+    let lease_id = symbol_short!("test_lease");
+    client.create_lease_with_nft(
+        &lease_id,
+        &landlord,
+        &tenant,
+        &1000i128,
+        &RateType::PerDay,
+        &86400u64,
+        &2000u64,
+        &100i128,
+        &50i128,
+        &RateType::PerDay,
+        &nft_contract,
+        &token_id,
+    );
+    
+    // Verify usage rights exist
+    let usage_rights_before = client.check_usage_rights(&nft_contract, &token_id, &tenant);
+    assert!(usage_rights_before.is_some());
+    
+    // End lease as landlord
+    let result = client.end_lease(&lease_id, &landlord);
+    assert_eq!(result, symbol_short!("ended"));
+    
+    // Verify usage rights were removed
+    let usage_rights_after = client.check_usage_rights(&nft_contract, &token_id, &tenant);
+    assert!(usage_rights_after.is_none());
+    
+    // Verify lease status is terminated
+    let lease = client.get_lease(&lease_id);
+    assert_eq!(lease.status, LeaseStatus::Terminated);
+    assert!(!lease.active);
+}
+
+/// Test that unauthorized parties cannot end lease
+#[test]
+fn test_end_lease_unauthorized_fails() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let nft_contract = Address::generate(&env);
+    let token_id: u128 = 789;
+    
+    // Create lease with NFT
+    let lease_id = symbol_short!("test_lease");
+    client.create_lease_with_nft(
+        &lease_id,
+        &landlord,
+        &tenant,
+        &1000i128,
+        &RateType::PerDay,
+        &86400u64,
+        &2000u64,
+        &100i128,
+        &50i128,
+        &RateType::PerDay,
+        &nft_contract,
+        &token_id,
+    );
+    
+    // Try to end lease as unauthorized party
+    let result = client.try_end_lease(&lease_id, &stranger);
+    assert!(result.is_err());
+}
+
+/// Test usage rights expiration
+#[test]
+fn test_usage_rights_expiration() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let nft_contract = Address::generate(&env);
+    let token_id: u128 = 999;
+    
+    // Create lease with NFT with short duration
+    let lease_id = symbol_short!("test_lease");
+    client.create_lease_with_nft(
+        &lease_id,
+        &landlord,
+        &tenant,
+        &1000i128,
+        &RateType::PerDay,
+        &100u64, // Very short duration
+        &2000u64,
+        &100i128,
+        &50i128,
+        &RateType::PerDay,
+        &nft_contract,
+        &token_id,
+    );
+    
+    // Verify usage rights exist initially
+    let usage_rights_before = client.check_usage_rights(&nft_contract, &token_id, &tenant);
+    assert!(usage_rights_before.is_some());
+    
+    // Advance time beyond lease duration
+    env.ledger().with_mut(|l| l.timestamp += 200u64);
+    
+    // Verify usage rights have expired
+    let usage_rights_after = client.check_usage_rights(&nft_contract, &token_id, &tenant);
+    assert!(usage_rights_after.is_none());
+}
+
+/// Test that tenant can also end lease
+#[test]
+fn test_end_lease_tenant_can_end() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let nft_contract = Address::generate(&env);
+    let token_id: u128 = 111;
+    
+    // Create lease with NFT
+    let lease_id = symbol_short!("test_lease");
+    client.create_lease_with_nft(
+        &lease_id,
+        &landlord,
+        &tenant,
+        &1000i128,
+        &RateType::PerDay,
+        &86400u64,
+        &2000u64,
+        &100i128,
+        &50i128,
+        &RateType::PerDay,
+        &nft_contract,
+        &token_id,
+    );
+    
+    // End lease as tenant
+    let result = client.end_lease(&lease_id, &tenant);
+    assert_eq!(result, symbol_short!("ended"));
+    
+    // Verify usage rights were removed
+    let usage_rights = client.check_usage_rights(&nft_contract, &token_id, &tenant);
+    assert!(usage_rights.is_none());
+}
+
+/// Tenant can also invoke termination (not just landlord).
+#[test]
+fn test_terminate_lease_tenant_can_terminate() {
+    // Arrange
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    seed_lease(&env, &id, LEASE_ID, &make_lease(&env, &landlord, &tenant));
+    env.ledger().with_mut(|l| l.timestamp = END + 1);
+
+    // Act
+    let result = client.terminate_lease(&LEASE_ID, &tenant);
+
+    // Assert
+    assert_eq!(result, ());
+    assert!(read_lease(&env, &id, LEASE_ID).is_none());
+}
+
+/// Termination is idempotent — second call returns LeaseNotFound.
+#[test]
+fn test_terminate_lease_idempotent() {
+    // Arrange
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    seed_lease(&env, &id, LEASE_ID, &make_lease(&env, &landlord, &tenant));
+    env.ledger().with_mut(|l| l.timestamp = END + 1);
+    client.terminate_lease(&LEASE_ID, &landlord);
+
+    // Act — second call
+    let result = client.try_terminate_lease(&LEASE_ID, &landlord);
+
+    // Assert
+    assert_eq!(result, Err(Ok(LeaseError::LeaseNotFound)));
+}
+
+/// archive_lease helper moves the entry to persistent HistoricalLease storage.
+#[test]
+fn test_terminate_archived_lease_moves_to_historical() {
+    // Arrange
+    let env = make_env();
+    let (id, _) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let lease = make_lease(&env, &landlord, &tenant);
+
+    env.ledger().with_mut(|l| l.timestamp = END + 1);
+
+    // Act — call archive_lease inside the contract context
+    env.as_contract(&id, || {
+        save_lease(&env, LEASE_ID, &lease);
+        archive_lease(&env, LEASE_ID, lease.clone(), landlord.clone());
+    });
+
+    // Assert — active storage cleared
+    assert!(read_lease(&env, &id, LEASE_ID).is_none());
+
+    // Assert — historical record exists in persistent storage
+    let record: HistoricalLease = env.as_contract(&id, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::HistoricalLease(LEASE_ID))
+            .expect("HistoricalLease not found")
+    });
+
+    assert_eq!(record.lease, lease);
+    assert_eq!(record.terminated_by, landlord);
+    assert_eq!(record.terminated_at, END + 1);
 #[should_panic(expected = "Lease not found")]
 fn test_get_nonexistent_lease() {
     let env = Env::default();
