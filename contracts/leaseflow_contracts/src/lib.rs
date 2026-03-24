@@ -7,6 +7,21 @@ use soroban_sdk::{
 // Re-export the pure math function so contract callers and tests can use it.
 // pub use leaseflow_math::calculate_total_cost; // Only if available in dependencies
 
+// ---------------------------------------------------------------------------
+// Existing simple Lease struct (preserved for backwards compatibility)
+// ---------------------------------------------------------------------------
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Lease {
+    pub landlord: Address,
+    pub tenant: Address,
+    pub amount: i128,
+    pub active: bool,
+    /// Optional price at which the tenant can buy out the asset.
+    pub buyout_price: Option<i128>,
+    /// Total cumulative payments made by the tenant.
+    pub cumulative_payments: i128,
 macro_rules! require {
     ($condition:expr, $error_msg:expr) => {
         if !$condition {
@@ -84,6 +99,13 @@ pub struct LeaseInstance {
     pub token_id: Option<u128>,
     pub active: bool,
     pub rent_paid: i128,
+    pub expiry_time: u64,
+    /// IPFS / HTTP URI pointing to the off-chain lease document.
+    pub property_uri: String,
+    /// Optional price at which the tenant can buy out the asset.
+    pub buyout_price: Option<i128>,
+    /// Total cumulative payments made by the tenant.
+    pub cumulative_payments: i128,
     pub debt: i128,
 }
 
@@ -245,6 +267,8 @@ impl LeaseContract {
             active: true,
             rent_paid: 0,
             expiry_time,
+            buyout_price: None,
+            cumulative_payments: 0,
         };
 
         env.storage().instance().set(&lease_id, &lease);
@@ -299,6 +323,12 @@ impl LeaseContract {
             grace_period_end,
             late_fee_flat,
             debt: 0,
+            flat_fee_applied: false,
+            seconds_late_charged: 0,
+            rent_paid: 0,
+            expiry_time,
+            buyout_price: None,
+            cumulative_payments: 0,
         };
 
         // Grant usage rights to the tenant for the lease duration
@@ -500,6 +530,39 @@ impl LeaseContract {
             lease_id: lease_id.clone(),
             month,
             amount,
+            active: true,
+            buyout_price: None,
+            cumulative_payments: 0,
+        };
+        env.storage()
+            .instance()
+            .set(&symbol_short!("lease"), &lease);
+        symbol_short!("created")
+    }
+
+    /// Sets the buyout price for a lease. Can only be called by the landlord.
+    pub fn set_buyout_price(env: Env, lease_id: Symbol, landlord: Address, buyout_price: i128) -> Symbol {
+        let mut lease = Self::get_lease(env.clone(), lease_id.clone());
+        
+        require!(
+            lease.landlord == landlord,
+            "Unauthorized: Only landlord can set buyout price"
+        );
+        require!(buyout_price > 0, "Buyout price must be positive");
+        
+        lease.buyout_price = Some(buyout_price);
+        
+        env.storage().instance().set(&lease_id, &lease);
+        symbol_short!("buyout_set")
+    }
+
+    /// Returns the current simple lease details stored in the contract.
+    pub fn get_lease(env: Env) -> Lease {
+        env.storage()
+            .instance()
+            .get(&symbol_short!("lease"))
+            .expect("Lease not found")
+    }
             date: env.ledger().timestamp(),
         };
         
@@ -508,6 +571,42 @@ impl LeaseContract {
         lease.rent_paid += amount;
         save_lease(&env, &lease_id, &lease);
 
+    /// Creates a full LeaseInstance keyed by lease_id.
+    pub fn create_lease_instance(
+        env: Env,
+        lease_id: u64,
+        landlord: Address,
+        params: CreateLeaseParams,
+    ) -> Result<(), LeaseError> {
+        landlord.require_auth();
+        let lease = LeaseInstance {
+            landlord,
+            tenant: params.tenant,
+            rent_amount: params.rent_amount,
+            deposit_amount: params.deposit_amount,
+            start_date: params.start_date,
+            end_date: params.end_date,
+            rent_paid_through: 0,
+            deposit_status: DepositStatus::Held,
+            status: LeaseStatus::Pending,
+            property_uri: params.property_uri,
+            rent_per_sec: 0,
+            nft_contract: None,
+            token_id: None,
+            active: true,
+            grace_period_end: 0,
+            late_fee_flat: 0,
+            late_fee_per_sec: 0,
+            debt: 0,
+            flat_fee_applied: false,
+            seconds_late_charged: 0,
+            rent_paid: 0,
+            expiry_time: 0,
+            buyout_price: None,
+            cumulative_payments: 0,
+        };
+        save_lease(&env, lease_id, &lease);
+        Ok(())
         // Keep the contract "alive" for the duration of the lease
         env.storage().instance().extend_ttl(MONTH_IN_LEDGERS, YEAR_IN_LEDGERS);
         
@@ -518,6 +617,153 @@ impl LeaseContract {
         load_lease(&env, &lease_id).expect("Lease not found")
     }
 
+    /// Sets the buyout price for a LeaseInstance. Can only be called by the landlord.
+    pub fn set_lease_instance_buyout_price(
+        env: Env,
+        lease_id: u64,
+        landlord: Address,
+        buyout_price: i128,
+    ) -> Result<(), LeaseError> {
+        let mut lease = load_lease(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        if lease.landlord != landlord {
+            return Err(LeaseError::Unauthorised);
+        }
+        if buyout_price <= 0 {
+            panic!("Buyout price must be positive");
+        }
+        
+        lease.buyout_price = Some(buyout_price);
+        save_lease(&env, lease_id, &lease);
+        Ok(())
+    }
+
+    /// Processes a rent payment for LeaseInstance and checks for buyout condition.
+    pub fn pay_lease_instance_rent(
+        env: Env,
+        lease_id: u64,
+        payment_amount: i128,
+    ) -> Result<(), LeaseError> {
+        let mut lease = load_lease(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        if !lease.active {
+            return Err(LeaseError::LeaseNotFound);
+        }
+        
+        // Track cumulative payments
+        lease.cumulative_payments += payment_amount;
+        
+        // Check for buyout condition
+        if let Some(buyout_price) = lease.buyout_price {
+            if lease.cumulative_payments >= buyout_price {
+                // Transfer ownership to tenant
+                lease.active = false;
+                lease.status = LeaseStatus::Terminated;
+                
+                // If there's an NFT, transfer it to the tenant
+                if let (Some(nft_contract), Some(token_id)) = (&lease.nft_contract, &lease.token_id) {
+                    let nft_client = nft_contract::NftClient::new(&env, nft_contract);
+                    nft_client.transfer_from(
+                        &env.current_contract_address(),
+                        &lease.landlord,
+                        &lease.tenant,
+                        token_id,
+                    );
+                }
+                
+                // Archive the lease after buyout
+                archive_lease(&env, lease_id, lease, env.current_contract_address());
+                return Ok(());
+            }
+        }
+        
+        save_lease(&env, lease_id, &lease);
+        Ok(())
+    }
+
+    /// Terminates an expired lease and clears or archives its state from ledger storage.
+    ///
+    /// # Arguments
+    /// * `env`      - The Soroban environment
+    /// * `lease_id` - Unique identifier of the lease to terminate
+    /// * `caller`   - Address of the party invoking termination (landlord, tenant, or admin)
+    ///
+    /// # Errors
+    /// * `LeaseError::LeaseNotFound`    - No lease exists for the given ID
+    /// * `LeaseError::LeaseNotExpired`  - Current ledger timestamp is before `end_date`
+    /// * `LeaseError::RentOutstanding`  - One or more rent payments remain unpaid
+    /// * `LeaseError::DepositNotSettled`- Security deposit has not been returned or claimed
+    /// * `LeaseError::Unauthorised`     - Caller is not landlord, tenant, or admin
+    ///
+    /// # Security
+    /// Caller must be the landlord, tenant, or an authorised protocol admin.
+    /// Termination is idempotent: a second call on the same ID returns LeaseNotFound.
+    /// Partial rent payment is never acceptable.
+    /// The deposit must be fully Settled before termination is allowed.
+    ///
+    /// # Storage strategy
+    /// DELETE — entry is fully removed from instance storage for maximum fee savings.
+    /// TODO: consider archival strategy (archive_lease helper) if audit trail is required.
+    pub fn terminate_lease(
+        env: Env,
+        lease_id: u64,
+        caller: Address,
+    ) -> Result<(), LeaseError> {
+        // 1. Load lease — return LeaseNotFound if missing.
+        let lease = load_lease(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+
+        // 2. Authorisation — caller must be landlord, tenant, or admin.
+        let is_landlord = caller == lease.landlord;
+        let is_tenant = caller == lease.tenant;
+        let is_admin = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .map(|admin| admin == caller)
+            .unwrap_or(false);
+
+        if !is_landlord && !is_tenant && !is_admin {
+            return Err(LeaseError::Unauthorised);
+        }
+        caller.require_auth();
+
+        if remaining > 0 {
+            lease.rent_paid += remaining;
+            lease.cumulative_payments += payment_amount;
+
+            // Monthly rent = per-second rate × seconds-in-30-days.
+            let monthly_rent = lease.rent_per_sec.saturating_mul(2_592_000);
+            if lease.rent_paid >= monthly_rent {
+                lease.rent_paid -= monthly_rent;
+                lease.grace_period_end = lease.grace_period_end.saturating_add(2_592_000);
+                lease.flat_fee_applied = false;
+                lease.seconds_late_charged = 0;
+            }
+        }
+
+        env.storage().instance().set(&lease_id, &lease);
+        
+        // Check for buyout condition
+        if let Some(buyout_price) = lease.buyout_price {
+            if lease.cumulative_payments >= buyout_price {
+                // Transfer ownership to tenant
+                lease.active = false;
+                lease.status = LeaseStatus::Terminated;
+                
+                // If there's an NFT, transfer it to the tenant
+                if let (Some(nft_contract), Some(token_id)) = (&lease.nft_contract, &lease.token_id) {
+                    let nft_client = nft_contract::NftClient::new(&env, nft_contract);
+                    nft_client.transfer_from(
+                        &env.current_contract_address(),
+                        &lease.landlord,
+                        &lease.tenant,
+                        token_id,
+                    );
+                }
+            }
+        }
+        
+        symbol_short!("paid")
     pub fn get_receipt(env: Env, lease_id: Symbol, month: u32) -> Receipt {
         env.storage()
             .instance()
