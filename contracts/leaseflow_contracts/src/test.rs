@@ -33,7 +33,6 @@ fn make_lease(env: &Env, landlord: &Address, tenant: &Address) -> LeaseInstance 
         nft_contract: None,
         token_id: None,
         active: true,
-        grace_period_end: 0,
         late_fee_flat: 0,
         late_fee_per_sec: 0,
         debt: 0,
@@ -41,10 +40,6 @@ fn make_lease(env: &Env, landlord: &Address, tenant: &Address) -> LeaseInstance 
         seconds_late_charged: 0,
         rent_paid: 0,
         expiry_time: END,
-        nft_contract: None,
-        token_id: None,
-        active: true,
-        expiry_time: 0,
         buyout_price: None,
         cumulative_payments: 0,
         withdrawal_address: None,
@@ -772,6 +767,10 @@ fn test_set_lease_instance_buyout_price() {
         property_uri: String::from_str(&env, "ipfs://test"),
         security_deposit: 500,
         arbitrators: soroban_sdk::Vec::new(&env),
+        rent_per_sec: 1,
+        late_fee_flat: 0,
+        late_fee_per_sec: 0,
+        grace_period_end: END,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -800,6 +799,10 @@ fn test_lease_instance_buyout_execution() {
         property_uri: String::from_str(&env, "ipfs://test"),
         security_deposit: 500,
         arbitrators: soroban_sdk::Vec::new(&env),
+        rent_per_sec: 1,
+        late_fee_flat: 0,
+        late_fee_per_sec: 0,
+        grace_period_end: END,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -842,6 +845,10 @@ fn test_buyout_price_not_reached() {
         property_uri: String::from_str(&env, "ipfs://test"),
         security_deposit: 500,
         arbitrators: soroban_sdk::Vec::new(&env),
+        rent_per_sec: 1,
+        late_fee_flat: 0,
+        late_fee_per_sec: 0,
+        grace_period_end: END,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1057,6 +1064,10 @@ fn test_create_lease_instance_with_security_deposit() {
         end_date: END,
         property_uri: String::from_str(&env, "ipfs://test"),
         arbitrators: soroban_sdk::Vec::new(&env),
+        rent_per_sec: 1,
+        late_fee_flat: 0,
+        late_fee_per_sec: 0,
+        grace_period_end: END,
     };
 
     // Act
@@ -1070,4 +1081,74 @@ fn test_create_lease_instance_with_security_deposit() {
     assert_eq!(lease.security_deposit, 500);
     assert_eq!(lease.status, LeaseStatus::Pending);
     assert_eq!(lease.deposit_status, DepositStatus::Held);
+}
+
+#[test]
+fn test_tenant_default_scenario_3_months_non_payment() {
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    
+    // Set 1 month = 30 days = 2,592,000 seconds
+    let month_in_secs: u64 = 2_592_000;
+    let rent_per_sec = 1i128;
+    let rent_amount = (month_in_secs as i128) * rent_per_sec; 
+    let grace_period_secs = 5 * 86400; // 5 days
+    
+    let start_date = 10_000_000u64;
+    env.ledger().with_mut(|l| l.timestamp = start_date);
+
+    let params = CreateLeaseParams {
+        tenant: tenant.clone(),
+        rent_amount,
+        deposit_amount: rent_amount * 2,
+        security_deposit: rent_amount,
+        start_date,
+        end_date: start_date + month_in_secs * 12,
+        property_uri: String::from_str(&env, "ipfs://test"),
+        arbitrators: soroban_sdk::Vec::new(&env),
+        rent_per_sec,
+        late_fee_flat: 100,
+        late_fee_per_sec: 2,
+        grace_period_end: start_date + month_in_secs + grace_period_secs,
+    };
+
+    client.create_lease_instance(&LEASE_ID, &landlord, &params);
+    
+    // Fast forward 1 month and 4 days (within grace period of first month)
+    env.ledger().with_mut(|l| l.timestamp = start_date + month_in_secs + grace_period_secs - 1);
+    let debt_1 = client.check_tenant_default(&LEASE_ID).unwrap();
+    // debt should be unpaid rent for ~1 month (no late fees since still in grace period)
+    assert_eq!(debt_1, (month_in_secs + grace_period_secs - 1) as i128 * rent_per_sec);
+    
+    // Fast forward 1 month and 6 days (grace period exceeded)
+    env.ledger().with_mut(|l| l.timestamp = start_date + month_in_secs + grace_period_secs + 1);
+    let debt_2 = client.check_tenant_default(&LEASE_ID).unwrap();
+    // Debt should include flat fee (100) + 1 second of late fee (2) + unpaid rent
+    let expected_unpaid_2 = (month_in_secs + grace_period_secs + 1) as i128 * rent_per_sec;
+    assert_eq!(debt_2, expected_unpaid_2 + 100 + 2);
+    
+    // Fast forward 3 months
+    let three_months = start_date + month_in_secs * 3;
+    env.ledger().with_mut(|l| l.timestamp = three_months);
+    let debt_3 = client.check_tenant_default(&LEASE_ID).unwrap();
+    
+    // Unpaid rent = 3 months
+    let expected_unpaid_3 = (month_in_secs * 3) as i128 * rent_per_sec;
+    let late_seconds = three_months - (start_date + month_in_secs + grace_period_secs);
+    let expected_late_fees = 100 + (late_seconds as i128 * 2);
+    assert_eq!(debt_3, expected_unpaid_3 + expected_late_fees);
+    
+    // Threshold is 2 * rent_amount. Eviction event should be emitted.
+    let events = env.events().all();
+    assert!(events.len() > 0);
+    
+    let expected_event = EvictionEligible {
+        lease_id: LEASE_ID,
+        tenant: tenant.clone(),
+        debt: debt_3,
+    };
+    let last_index = events.len() - 1;
+    assert_eq!(events[last_index], expected_event.to_xdr(&env, &id));
 }
