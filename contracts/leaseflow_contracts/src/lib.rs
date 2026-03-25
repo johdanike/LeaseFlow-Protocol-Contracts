@@ -100,15 +100,23 @@ pub struct LeaseInstance {
     pub token_id: Option<u128>,
     pub active: bool,
     pub rent_paid: i128,
-    pub rent_paid_through: u64,
-    pub deposit_status: DepositStatus,
+    pub expiry_time: u64,
+    /// Optional price at which the tenant can buy out the asset.
     pub buyout_price: Option<i128>,
     pub cumulative_payments: i128,
-    pub maintenance_status: MaintenanceStatus,
-    pub repair_proof_hash: Option<BytesN<32>>,
-    pub withheld_rent: i128,
-    pub inspector: Option<Address>,
-    pub payment_token: Address,
+    pub debt: i128,
+    pub rent_paid_through: u64,
+    pub deposit_status: DepositStatus,
+    pub rent_per_sec: i128,
+    pub grace_period_end: u64,
+    pub late_fee_flat: i128,
+    pub late_fee_per_sec: i128,
+    pub flat_fee_applied: bool,
+    pub seconds_late_charged: u64,
+    /// Pre-approved destination for landlord's rent withdrawals.
+    pub withdrawal_address: Option<Address>,
+    /// Total rent withdrawn by the landlord.
+    pub rent_withdrawn: i128,
 }
 
 
@@ -254,6 +262,7 @@ pub enum LeaseError {
     NftNotReturned = 8,
     UsageRightsNotFound = 9,
     UsageRightsExpired = 10,
+    WithdrawalAddressNotSet = 11,
 }
 
 
@@ -532,10 +541,36 @@ impl LeaseContract {
 
     pub fn create_lease_instance(env: Env, lease_id: u64, landlord: Address, params: CreateLeaseParams) -> Result<(), LeaseError> {
         landlord.require_auth();
-        Self::require_kyc(&env, &landlord, &params.tenant)?;
-        Self::require_stablecoin(&env, &params.payment_token)?;
-        let lease = LeaseInstance { landlord, tenant: params.tenant, rent_amount: params.rent_amount, deposit_amount: params.deposit_amount, security_deposit: params.security_deposit, start_date: params.start_date, end_date: params.end_date, property_uri: params.property_uri, status: LeaseStatus::Pending, nft_contract: None, token_id: None, active: true, rent_paid: 0, rent_paid_through: params.start_date, deposit_status: DepositStatus::Held, buyout_price: None, cumulative_payments: 0, maintenance_status: MaintenanceStatus::None, repair_proof_hash: None, withheld_rent: 0, inspector: None, payment_token: params.payment_token, };
-        save_lease_instance(&env, lease_id, &lease);
+        let lease = LeaseInstance {
+            landlord,
+            tenant: params.tenant,
+            rent_amount: params.rent_amount,
+            deposit_amount: params.deposit_amount,
+            security_deposit: params.security_deposit,
+            start_date: params.start_date,
+            end_date: params.end_date,
+            rent_paid_through: 0,
+            deposit_status: DepositStatus::Held,
+            status: LeaseStatus::Pending,
+            property_uri: params.property_uri,
+            nft_contract: None,
+            token_id: None,
+            active: true,
+            debt: 0,
+            rent_paid: 0,
+            expiry_time: params.end_date,
+            buyout_price: None,
+            cumulative_payments: 0,
+            rent_per_sec: 0,
+            grace_period_end: params.end_date,
+            late_fee_flat: 0,
+            late_fee_per_sec: 0,
+            flat_fee_applied: false,
+            seconds_late_charged: 0,
+            withdrawal_address: None,
+            rent_withdrawn: 0,
+        };
+        save_lease(&env, lease_id, &lease);
         Ok(())
     }
 
@@ -582,9 +617,116 @@ impl LeaseContract {
         Ok(())
     }
 
-    pub fn terminate_lease(env: Env, lease_id: u64, caller: Address) -> Result<(), LeaseError> {
-        let lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
-        if caller != lease.landlord && caller != lease.tenant { return Err(LeaseError::Unauthorised); }
+    /// Sets the pre-approved withdrawal address for the landlord.
+    /// Only the landlord can call this function.
+    pub fn set_withdrawal_address(
+        env: Env,
+        lease_id: u64,
+        withdrawal_address: Address,
+    ) -> Result<(), LeaseError> {
+        let mut lease = load_lease(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+
+        // Authorize landlord
+        lease.landlord.require_auth();
+
+        lease.withdrawal_address = Some(withdrawal_address);
+        save_lease(&env, lease_id, &lease);
+        Ok(())
+    }
+
+    /// Landlord withdraws accumulated rent to the pre-approved address.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `lease_id` - Unique identifier of the lease
+    /// * `token_contract_id` - The asset ID of the rent token to withdraw
+    ///
+    /// # Errors
+    /// * `LeaseError::LeaseNotFound` - No lease exists for the given ID
+    /// * `LeaseError::Unauthorised` - Caller is not the landlord
+    /// * `LeaseError::WithdrawalAddressNotSet` - Withdrawal address has not been set
+    ///
+    /// # Panics
+    /// Panics if there are no funds to withdraw.
+    pub fn withdraw_rent(
+        env: Env,
+        lease_id: u64,
+        token_contract_id: Address,
+    ) -> Result<(), LeaseError> {
+        let mut lease = load_lease(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+
+        // Authorize landlord
+        lease.landlord.require_auth();
+
+        let withdrawal_address = lease
+            .withdrawal_address
+            .clone()
+            .ok_or(LeaseError::WithdrawalAddressNotSet)?;
+
+        let withdrawable_amount = lease.rent_paid - lease.rent_withdrawn;
+        if withdrawable_amount <= 0 {
+            panic!("No rent to withdraw");
+        }
+
+        // Transfer funds
+        let token_client = soroban_sdk::token::Client::new(&env, &token_contract_id);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &withdrawal_address,
+            &withdrawable_amount,
+        );
+
+        // Update state
+        lease.rent_withdrawn += withdrawable_amount;
+        save_lease(&env, lease_id, &lease);
+
+        Ok(())
+    }
+
+    /// Terminates an expired lease and clears or archives its state from ledger storage.
+    ///
+    /// # Arguments
+    /// * `env`      - The Soroban environment
+    /// * `lease_id` - Unique identifier of the lease to terminate
+    /// * `caller`   - Address of the party invoking termination (landlord, tenant, or admin)
+    ///
+    /// # Errors
+    /// * `LeaseError::LeaseNotFound`    - No lease exists for the given ID
+    /// * `LeaseError::LeaseNotExpired`  - Current ledger timestamp is before `end_date`
+    /// * `LeaseError::RentOutstanding`  - One or more rent payments remain unpaid
+    /// * `LeaseError::DepositNotSettled`- Security deposit has not been returned or claimed
+    /// * `LeaseError::Unauthorised`     - Caller is not landlord, tenant, or admin
+    ///
+    /// # Security
+    /// Caller must be the landlord, tenant, or an authorised protocol admin.
+    /// Termination is idempotent: a second call on the same ID returns LeaseNotFound.
+    /// Partial rent payment is never acceptable.
+    /// The deposit must be fully Settled before termination is allowed.
+    ///
+    /// # Storage strategy
+    /// DELETE — entry is fully removed from instance storage for maximum fee savings.
+    /// TODO: consider archival strategy (archive_lease helper) if audit trail is required.
+    pub fn terminate_lease(
+        env: Env,
+        lease_id: u64,
+        caller: Address,
+    ) -> Result<(), LeaseError> {
+        // 1. Load lease — return LeaseNotFound if missing.
+        let lease = load_lease(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+
+        // 2. Authorisation — caller must be landlord, tenant, or admin.
+        let is_landlord = caller == lease.landlord;
+        let is_tenant = caller == lease.tenant;
+        let is_admin = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .map(|admin| admin == caller)
+            .unwrap_or(false);
+
+        if !is_landlord && !is_tenant && !is_admin {
+            return Err(LeaseError::Unauthorised);
+        }
         caller.require_auth();
         if env.ledger().timestamp() < lease.end_date { return Err(LeaseError::LeaseNotExpired); }
         if lease.deposit_status == DepositStatus::Held || lease.deposit_status == DepositStatus::Disputed { return Err(LeaseError::DepositNotSettled); }
