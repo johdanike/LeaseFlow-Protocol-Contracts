@@ -3,10 +3,11 @@
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
-    Address, Env, String, Symbol, symbol_short, BytesN, contract, contractimpl,
+    Address, Env, String, contract, contractimpl, contractclient, Event,
 };
+use soroban_sdk::Event;
 use crate::{LeaseContract, LeaseContractClient, LeaseStatus, MaintenanceStatus, DepositStatus, CreateLeaseParams, RateType, HistoricalLease, DataKey, 
-    MaintenanceIssueReported, RepairProofSubmitted, MaintenanceVerified, LeaseStarted, LeaseTerminated, DepositReleasePartial};
+    MaintenanceIssueReported, RepairProofSubmitted, MaintenanceVerified, LeaseStarted, LeaseTerminated, DepositReleasePartial, EvictionEligible, EmergencyRentPaused, EmergencyRentResumed};
 
 const START: u64 = 1711929600; 
 const END: u64 = 1714521600;   
@@ -23,6 +24,47 @@ impl KycMock {
     }
     pub fn set_verified(env: Env, address: Address, status: bool) {
         env.storage().instance().set(&address, &status);
+    }
+}
+
+// --- NFT Mock ---
+#[contract]
+pub struct MockNft;
+
+#[contractimpl]
+impl MockNft {
+    pub fn transfer_from(env: Env, _spender: Address, _from: Address, to: Address, token_id: u128) {
+        env.storage().instance().set(&token_id, &to);
+    }
+
+    pub fn owner_of(env: Env, token_id: u128) -> Address {
+        env.storage().instance().get(&token_id).unwrap()
+    }
+}
+
+// --- Token Mock (minimal subset used by withdraw tests) ---
+#[contract]
+pub struct TokenMock;
+
+#[contractimpl]
+impl TokenMock {
+    pub fn mint(env: Env, to: Address, amount: i128) {
+        let current: i128 = env.storage().instance().get(&to).unwrap_or(0);
+        env.storage().instance().set(&to, &(current + amount));
+    }
+
+    pub fn balance(env: Env, id: Address) -> i128 {
+        env.storage().instance().get(&id).unwrap_or(0)
+    }
+
+    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        from.require_auth();
+        let from_balance: i128 = env.storage().instance().get(&from).unwrap_or(0);
+        require!(from_balance >= amount, "insufficient balance");
+        env.storage().instance().set(&from, &(from_balance - amount));
+
+        let to_balance: i128 = env.storage().instance().get(&to).unwrap_or(0);
+        env.storage().instance().set(&to, &(to_balance + amount));
     }
 }
 
@@ -52,19 +94,36 @@ fn make_lease(env: &Env, landlord: &Address, tenant: &Address) -> LeaseInstance 
         status: LeaseStatus::Active,
         nft_contract: None,
         token_id: None,
+        payment_token: Address::generate(env),
         active: true,
-        late_fee_flat: 0,
-        late_fee_per_sec: 0,
-        debt: 0,
-        flat_fee_applied: false,
-        seconds_late_charged: 0,
         rent_paid: 0,
         expiry_time: END,
         buyout_price: None,
         cumulative_payments: 0,
+        debt: 0,
+        rent_paid_through: 0,
+        deposit_status: DepositStatus::Held,
+        rent_per_sec: 0,
+        grace_period_end: END,
+        late_fee_flat: 0,
+        late_fee_per_sec: 0,
+        flat_fee_applied: false,
+        seconds_late_charged: 0,
         withdrawal_address: None,
         rent_withdrawn: 0,
         arbitrators: soroban_sdk::Vec::new(env),
+        // Emergency pause fields
+        paused: false,
+        pause_reason: None,
+        paused_at: None,
+        pause_initiator: None,
+        total_paused_duration: 0,
+        // Other missing fields
+        payment_token: Address::generate(env),
+        maintenance_status: MaintenanceStatus::None,
+        withheld_rent: 0,
+        inspector: None,
+        repair_proof_hash: None,
     }
 }
 
@@ -123,13 +182,13 @@ fn test_lease_basic() {
     // ── 2. Pay Rent: Monthly receipts in Instance storage ──────────────────────
     let month = 1;
     let amount_paid = 5000i128;
-    client.pay_rent(&lease_id, &month, &amount_paid);
+    client.pay_rent_receipt(&lease_id, &month, &amount_paid);
 
     let receipt = client.get_receipt(&lease_id, &month);
     assert_eq!(receipt.lease_id, lease_id);
     assert_eq!(receipt.month, month);
     assert_eq!(receipt.amount, amount_paid);
-    assert_eq!(receipt.date, 0); // Ledger starts at 0 
+    assert_eq!(receipt.date, START);
 
     // ── 3. TTL Extension Check (Simplified) ───────────────────────────────────
     client.extend_ttl(&lease_id);
@@ -276,6 +335,7 @@ fn test_terminate_lease_emits_terminated_event() {
     };
     
     let events = env.events().all();
+    let events = events.events();
     assert_eq!(events.len(), 2);
     assert_eq!(events[0], expected_terminated.to_xdr(&env, &id));
     assert_eq!(events[1], expected_ended.to_xdr(&env, &id));
@@ -289,12 +349,19 @@ fn test_activate_lease_emits_started_event() {
     let (id, client) = setup(&env);
     let landlord = Address::generate(&env);
     let tenant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
 
     // Create a pending lease first
-    client.create_lease(&landlord, &tenant, &1000i128);
+    client.set_admin(&admin);
+    client.add_allowed_asset(&admin, &token);
+
+    let lease_id = symbol_short!("lease");
+    let uri = String::from_str(&env, "ipfs://test");
+    client.initialize_lease(&lease_id, &landlord, &tenant, &1000i128, &0i128, &60u64, &uri, &token);
 
     // Act
-    let result = client.activate_lease(&symbol_short!("lease"), &tenant);
+    let result = client.activate_lease(&lease_id, &tenant);
 
     // Assert
     assert_eq!(result, symbol_short!("active"));
@@ -309,6 +376,7 @@ fn test_activate_lease_emits_started_event() {
     };
     
     let events = env.events().all();
+    let events = events.events();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0], expected.to_xdr(&env, &id));
 }
@@ -338,6 +406,7 @@ fn test_reclaim_asset_emits_reclaimed_event() {
     };
     
     let events = env.events().all();
+    let events = events.events();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0], expected.to_xdr(&env, &id));
 }
@@ -356,13 +425,14 @@ fn test_reclaim_asset_unauthorized() {
     seed_lease(&env, &id, LEASE_ID, &make_lease(&env, &landlord, &tenant));
 
     // Act
-    let result = client.reclaim_asset(&LEASE_ID, &unauthorized, &reason);
+    let result = client.try_reclaim_asset(&LEASE_ID, &unauthorized, &reason);
 
     // Assert
     assert_eq!(result, Err(Ok(LeaseError::Unauthorised)));
     
     // No events should be emitted
     let events = env.events().all();
+    let events = events.events();
     assert_eq!(events.len(), 0);
 }
 
@@ -378,16 +448,15 @@ fn test_reclaim_success() {
     lease.deposit_amount = 0; // Simulate dry stream
     seed_lease(&env, &id, LEASE_ID, &lease);
 
-    let result = client.reclaim(&LEASE_ID, &landlord);
+    client.reclaim(&LEASE_ID, &landlord);
 
-    assert_eq!(result, Ok(()));
+    let events = env.events().all();
+    let events = events.events();
+    assert!(events.len() > 0); // AssetReclaimed emitted
 
     let updated_lease = read_lease(&env, &id, LEASE_ID).unwrap();
     assert_eq!(updated_lease.status, LeaseStatus::Terminated);
     assert!(!updated_lease.active);
-    
-    let events = env.events().all();
-    assert!(events.len() > 0); // AssetReclaimed emitted
 }
 
 /// Tests that reclaim fails when deposit_amount is greater than 0.
@@ -411,13 +480,6 @@ fn test_reclaim_fails_when_balance_not_zero() {
 // NFT Escrow Tests
 // ---------------------------------------------------------------------------
 
-/// Mock NFT contract for testing
-#[contractclient(name = "MockNftClient")]
-pub trait MockNftInterface {
-    fn transfer_from(env: Env, spender: Address, from: Address, to: Address, token_id: u128);
-    fn owner_of(env: Env, token_id: u128) -> Address;
-}
-
 /// Test that create_lease_with_nft transfers NFT to contract escrow
 #[test]
 fn test_create_lease_with_nft_escrows_to_contract() {
@@ -426,14 +488,18 @@ fn test_create_lease_with_nft_escrows_to_contract() {
     
     let landlord = Address::generate(&env);
     let tenant = Address::generate(&env);
-    let nft_contract = Address::generate(&env);
+    let nft_contract = env.register(MockNft, ());
     let token_id: u128 = 123;
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    client.set_admin(&admin);
+    client.add_allowed_asset(&admin, &token);
     
-    // Register mock NFT contract
     let nft_client = MockNftClient::new(&env, &nft_contract);
     
     // Create lease with NFT
-    let lease_id = symbol_short!("test_lease");
+    let lease_id = symbol_short!("tst_lease");
     let result = client.create_lease_with_nft(
         &lease_id,
         &landlord,
@@ -447,9 +513,13 @@ fn test_create_lease_with_nft_escrows_to_contract() {
         &RateType::PerDay,
         &nft_contract,
         &token_id,
+        &token,
     );
     
     assert_eq!(result, symbol_short!("created"));
+
+    // Verify NFT is escrowed to the lease contract
+    assert_eq!(nft_client.owner_of(&token_id), contract_id);
     
     // Verify usage rights were granted to tenant
     let usage_rights = client.check_usage_rights(&nft_contract, &token_id, &tenant);
@@ -470,11 +540,18 @@ fn test_end_lease_returns_nft_to_landlord() {
     
     let landlord = Address::generate(&env);
     let tenant = Address::generate(&env);
-    let nft_contract = Address::generate(&env);
+    let nft_contract = env.register(MockNft, ());
     let token_id: u128 = 456;
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    client.set_admin(&admin);
+    client.add_allowed_asset(&admin, &token);
+
+    let nft_client = MockNftClient::new(&env, &nft_contract);
     
     // Create lease with NFT first
-    let lease_id = symbol_short!("test_lease");
+    let lease_id = symbol_short!("tst_lease");
     client.create_lease_with_nft(
         &lease_id,
         &landlord,
@@ -488,7 +565,11 @@ fn test_end_lease_returns_nft_to_landlord() {
         &RateType::PerDay,
         &nft_contract,
         &token_id,
+        &token,
     );
+
+    // Escrowed to contract
+    assert_eq!(nft_client.owner_of(&token_id), contract_id);
     
     // Verify usage rights exist
     let usage_rights_before = client.check_usage_rights(&nft_contract, &token_id, &tenant);
@@ -502,9 +583,8 @@ fn test_end_lease_returns_nft_to_landlord() {
     let usage_rights_after = client.check_usage_rights(&nft_contract, &token_id, &tenant);
     assert!(usage_rights_after.is_none());
     
-    // Verify lease status is terminated
-    let lease = client.get_lease(&lease_id);
-    assert_eq!(lease.cumulative_payments, 5000);
+    // Verify NFT returned to landlord
+    assert_eq!(nft_client.owner_of(&token_id), landlord);
 }
 
 #[test]
@@ -528,12 +608,12 @@ fn test_maintenance_flow_with_events() {
         start_date: START,
         end_date: END,
         property_uri: String::from_str(&env, "ipfs://test"),
-        security_deposit: 500,
+        payment_token: token.clone(),
         arbitrators: soroban_sdk::Vec::new(&env),
         rent_per_sec: 1,
+        grace_period_end: END,
         late_fee_flat: 0,
         late_fee_per_sec: 0,
-        grace_period_end: END,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -546,36 +626,118 @@ fn test_maintenance_flow_with_events() {
 }
 
 #[test]
+fn test_batch_withdraw_rent_aggregates_payout() {
+    let env = make_env();
+    let (lease_contract_id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant_1 = Address::generate(&env);
+    let tenant_2 = Address::generate(&env);
+    let withdrawal = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token_contract_id = env.register(TokenMock, ());
+
+    client.set_admin(&admin);
+    client.add_allowed_asset(&admin, &token_contract_id);
+
+    let lease_id_1: u64 = 1;
+    let lease_id_2: u64 = 2;
+
+    let params_1 = CreateLeaseParams {
+        tenant: tenant_1,
+        rent_amount: 1000,
+        deposit_amount: 0,
+        security_deposit: 0,
+        start_date: START,
+        end_date: END,
+        property_uri: String::from_str(&env, "ipfs://test"),
+        payment_token: token_contract_id.clone(),
+        arbitrators: soroban_sdk::Vec::new(&env),
+        rent_per_sec: 1,
+        grace_period_end: END,
+        late_fee_flat: 0,
+        late_fee_per_sec: 0,
+    };
+
+    let params_2 = CreateLeaseParams {
+        tenant: tenant_2,
+        rent_amount: 1000,
+        deposit_amount: 0,
+        security_deposit: 0,
+        start_date: START,
+        end_date: END,
+        property_uri: String::from_str(&env, "ipfs://test"),
+        payment_token: token_contract_id.clone(),
+        arbitrators: soroban_sdk::Vec::new(&env),
+        rent_per_sec: 1,
+        grace_period_end: END,
+        late_fee_flat: 0,
+        late_fee_per_sec: 0,
+    };
+
+    client.create_lease_instance(&lease_id_1, &landlord, &params_1);
+    client.create_lease_instance(&lease_id_2, &landlord, &params_2);
+    client.set_withdrawal_address(&lease_id_1, &withdrawal);
+    client.set_withdrawal_address(&lease_id_2, &withdrawal);
+
+    // Record rent owed.
+    client.pay_lease_instance_rent(&lease_id_1, &100i128);
+    client.pay_lease_instance_rent(&lease_id_2, &200i128);
+
+    // Fund the lease contract with enough tokens to pay out.
+    let token_client = TokenMockClient::new(&env, &token_contract_id);
+    token_client.mint(&lease_contract_id, &300i128);
+
+    let mut lease_ids = soroban_sdk::Vec::new(&env);
+    lease_ids.push_back(lease_id_1);
+    lease_ids.push_back(lease_id_2);
+
+    let withdrawn = client.batch_withdraw_rent(&landlord, &lease_ids, &token_contract_id);
+    assert_eq!(withdrawn, 300i128);
+
+    assert_eq!(token_client.balance(&withdrawal), 300i128);
+    assert_eq!(token_client.balance(&lease_contract_id), 0i128);
+
+    let lease_1 = client.get_lease_instance(&lease_id_1);
+    let lease_2 = client.get_lease_instance(&lease_id_2);
+    assert_eq!(lease_1.rent_withdrawn, 100i128);
+    assert_eq!(lease_2.rent_withdrawn, 200i128);
+}
+
+#[test]
 fn test_lease_instance_buyout() {
     let env = make_env();
-    let (_, client) = setup(&env);
+    let (id, client) = setup(&env);
     let landlord = Address::generate(&env);
     let tenant = Address::generate(&env);
     let token = Address::generate(&env);
     let admin = Address::generate(&env);
 
+    client.set_admin(&admin);
+    client.add_allowed_asset(&admin, &token);
+
     let params = CreateLeaseParams {
         tenant: tenant.clone(),
         rent_amount: 1000,
         deposit_amount: 2000,
+        security_deposit: 500,
         start_date: START,
         end_date: END,
         property_uri: String::from_str(&env, "ipfs://test"),
-        security_deposit: 500,
+        payment_token: token.clone(),
         arbitrators: soroban_sdk::Vec::new(&env),
         rent_per_sec: 1,
+        grace_period_end: END,
         late_fee_flat: 0,
         late_fee_per_sec: 0,
-        grace_period_end: END,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
-    client.set_lease_instance_buyout_price(&LEASE_ID, &landlord, &3000i128).unwrap();
+    client.set_lease_instance_buyout_price(&LEASE_ID, &landlord, &3000i128);
     
     // Make payments that reach the buyout price
-    client.pay_lease_instance_rent(&LEASE_ID, &1000i128).unwrap();
-    client.pay_lease_instance_rent(&LEASE_ID, &1000i128).unwrap();
-    client.pay_lease_instance_rent(&LEASE_ID, &1000i128).unwrap();
+    client.pay_lease_instance_rent(&LEASE_ID, &1000i128);
+    client.pay_lease_instance_rent(&LEASE_ID, &1000i128);
+    client.pay_lease_instance_rent(&LEASE_ID, &1000i128);
     
     // Lease should be terminated and archived
     assert!(read_lease(&env, &id, LEASE_ID).is_none());
@@ -599,6 +761,11 @@ fn test_buyout_price_not_reached() {
     let (id, client) = setup(&env);
     let landlord = Address::generate(&env);
     let tenant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    client.set_admin(&admin);
+    client.add_allowed_asset(&admin, &token);
 
     let params = CreateLeaseParams {
         tenant: tenant.clone(),
@@ -608,21 +775,21 @@ fn test_buyout_price_not_reached() {
         start_date: START,
         end_date: END,
         property_uri: String::from_str(&env, "ipfs://test"),
-        security_deposit: 500,
+        payment_token: token.clone(),
         arbitrators: soroban_sdk::Vec::new(&env),
         rent_per_sec: 1,
+        grace_period_end: END,
         late_fee_flat: 0,
         late_fee_per_sec: 0,
-        grace_period_end: END,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
-    client.set_lease_instance_buyout_price(&LEASE_ID, &landlord, &1000);
+    client.set_lease_instance_buyout_price(&LEASE_ID, &landlord, &2000);
     client.pay_lease_instance_rent(&LEASE_ID, &1000);
     
     // Lease should still be active
     let lease = read_lease(&env, &id, LEASE_ID).unwrap();
-    assert_eq!(lease.cumulative_payments, 2000i128);
+    assert_eq!(lease.cumulative_payments, 1000i128);
     assert!(lease.active);
     assert_eq!(lease.status, LeaseStatus::Active);
 }
@@ -650,7 +817,7 @@ fn test_conclude_lease_no_damages_full_refund() {
     let result = client.conclude_lease(&LEASE_ID, &landlord, &0i128);
 
     // Assert
-    assert_eq!(result, Ok(500)); // Full security deposit refunded
+    assert_eq!(result, 500); // Full security deposit refunded
     let updated_lease = read_lease(&env, &id, LEASE_ID).unwrap();
     assert_eq!(updated_lease.status, LeaseStatus::Terminated);
     assert_eq!(updated_lease.deposit_status, DepositStatus::Settled);
@@ -675,7 +842,7 @@ fn test_conclude_lease_with_damages_partial_refund() {
     let result = client.conclude_lease(&LEASE_ID, &landlord, &200i128);
 
     // Assert
-    assert_eq!(result, Ok(300)); // 500 - 200 = 300 refunded
+    assert_eq!(result, 300); // 500 - 200 = 300 refunded
     let updated_lease = read_lease(&env, &id, LEASE_ID).unwrap();
     assert_eq!(updated_lease.status, LeaseStatus::Terminated);
     assert_eq!(updated_lease.deposit_status, DepositStatus::Settled);
@@ -816,6 +983,11 @@ fn test_create_lease_instance_with_security_deposit() {
     let (id, client) = setup(&env);
     let landlord = Address::generate(&env);
     let tenant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    client.set_admin(&admin);
+    client.add_allowed_asset(&admin, &token);
 
     let params = CreateLeaseParams {
         tenant: tenant.clone(),
@@ -825,18 +997,18 @@ fn test_create_lease_instance_with_security_deposit() {
         start_date: START,
         end_date: END,
         property_uri: String::from_str(&env, "ipfs://test"),
+        payment_token: token.clone(),
         arbitrators: soroban_sdk::Vec::new(&env),
         rent_per_sec: 1,
+        grace_period_end: END,
         late_fee_flat: 0,
         late_fee_per_sec: 0,
-        grace_period_end: END,
     };
 
     // Act
-    let result = client.create_lease_instance(&LEASE_ID, &landlord, &params);
+    client.create_lease_instance(&LEASE_ID, &landlord, &params);
 
     // Assert
-    assert_eq!(result, Ok(()));
     let lease = read_lease(&env, &id, LEASE_ID).unwrap();
     assert_eq!(lease.landlord, landlord);
     assert_eq!(lease.tenant, tenant);
@@ -851,6 +1023,11 @@ fn test_tenant_default_scenario_3_months_non_payment() {
     let (id, client) = setup(&env);
     let landlord = Address::generate(&env);
     let tenant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    client.set_admin(&admin);
+    client.add_allowed_asset(&admin, &token);
     
     // Set 1 month = 30 days = 2,592,000 seconds
     let month_in_secs: u64 = 2_592_000;
@@ -869,24 +1046,25 @@ fn test_tenant_default_scenario_3_months_non_payment() {
         start_date,
         end_date: start_date + month_in_secs * 12,
         property_uri: String::from_str(&env, "ipfs://test"),
+        payment_token: token.clone(),
         arbitrators: soroban_sdk::Vec::new(&env),
         rent_per_sec,
+        grace_period_end: start_date + month_in_secs + grace_period_secs,
         late_fee_flat: 100,
         late_fee_per_sec: 2,
-        grace_period_end: start_date + month_in_secs + grace_period_secs,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
     
     // Fast forward 1 month and 4 days (within grace period of first month)
     env.ledger().with_mut(|l| l.timestamp = start_date + month_in_secs + grace_period_secs - 1);
-    let debt_1 = client.check_tenant_default(&LEASE_ID).unwrap();
+    let debt_1 = client.check_tenant_default(&LEASE_ID);
     // debt should be unpaid rent for ~1 month (no late fees since still in grace period)
     assert_eq!(debt_1, (month_in_secs + grace_period_secs - 1) as i128 * rent_per_sec);
     
     // Fast forward 1 month and 6 days (grace period exceeded)
     env.ledger().with_mut(|l| l.timestamp = start_date + month_in_secs + grace_period_secs + 1);
-    let debt_2 = client.check_tenant_default(&LEASE_ID).unwrap();
+    let debt_2 = client.check_tenant_default(&LEASE_ID);
     // Debt should include flat fee (100) + 1 second of late fee (2) + unpaid rent
     let expected_unpaid_2 = (month_in_secs + grace_period_secs + 1) as i128 * rent_per_sec;
     assert_eq!(debt_2, expected_unpaid_2 + 100 + 2);
@@ -894,7 +1072,7 @@ fn test_tenant_default_scenario_3_months_non_payment() {
     // Fast forward 3 months
     let three_months = start_date + month_in_secs * 3;
     env.ledger().with_mut(|l| l.timestamp = three_months);
-    let debt_3 = client.check_tenant_default(&LEASE_ID).unwrap();
+    let debt_3 = client.check_tenant_default(&LEASE_ID);
     
     // Unpaid rent = 3 months
     let expected_unpaid_3 = (month_in_secs * 3) as i128 * rent_per_sec;
@@ -904,6 +1082,7 @@ fn test_tenant_default_scenario_3_months_non_payment() {
     
     // Threshold is 2 * rent_amount. Eviction event should be emitted.
     let events = env.events().all();
+    let events = events.events();
     assert!(events.len() > 0);
     
     let expected_event = EvictionEligible {
@@ -913,4 +1092,463 @@ fn test_tenant_default_scenario_3_months_non_payment() {
     };
     let last_index = events.len() - 1;
     assert_eq!(events[last_index], expected_event.to_xdr(&env, &id));
+}
+
+// ── Emergency Rent Pause Tests ────────────────────────────────────────────────
+
+#[test]
+fn test_emergency_pause_rent_by_admin() {
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let admin = Address::generate(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // Setup
+    client.set_admin(&admin);
+    client.add_allowed_asset(&admin, &token);
+
+    let params = CreateLeaseParams {
+        tenant: tenant.clone(),
+        rent_amount: 1000,
+        deposit_amount: 500,
+        security_deposit: 500,
+        start_date: START,
+        end_date: END,
+        property_uri: String::from_str(&env, "ipfs://test"),
+        payment_token: token,
+        rent_per_sec: 1,
+        grace_period_end: END,
+        late_fee_flat: 100,
+        late_fee_per_sec: 2,
+        arbitrators: soroban_sdk::Vec::new(&env),
+    };
+
+    client.create_lease_instance(&LEASE_ID, &landlord, &params);
+
+    // Test admin can pause rent
+    let reason = String::from_str(&env, "Flood damage - property uninhabitable");
+    client.emergency_pause_rent(&LEASE_ID, &admin, &reason);
+
+    // Verify lease is paused
+    let (paused, pause_reason, paused_at, _) = client.get_pause_status(&LEASE_ID).unwrap();
+    assert!(paused);
+    assert_eq!(pause_reason.unwrap(), reason);
+    assert_eq!(paused_at.unwrap(), START);
+
+    // Verify lease status changed to Paused
+    let lease = client.get_lease_instance(&LEASE_ID).unwrap();
+    assert_eq!(lease.status, LeaseStatus::Paused);
+
+    // Verify event was emitted
+    let events = env.events().all();
+    assert!(events.len() > 0);
+}
+
+#[test]
+fn test_emergency_pause_rent_by_landlord() {
+    let env = make_env();
+    let (_, client) = setup(&env);
+    let admin = Address::generate(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // Setup
+    client.set_admin(&admin);
+    client.add_allowed_asset(&admin, &token);
+
+    let params = CreateLeaseParams {
+        tenant: tenant.clone(),
+        rent_amount: 1000,
+        deposit_amount: 500,
+        security_deposit: 500,
+        start_date: START,
+        end_date: END,
+        property_uri: String::from_str(&env, "ipfs://test"),
+        payment_token: token,
+        rent_per_sec: 1,
+        grace_period_end: END,
+        late_fee_flat: 100,
+        late_fee_per_sec: 2,
+        arbitrators: soroban_sdk::Vec::new(&env),
+    };
+
+    client.create_lease_instance(&LEASE_ID, &landlord, &params);
+
+    // Test landlord can pause rent
+    let reason = String::from_str(&env, "Earthquake - building condemned");
+    client.emergency_pause_rent(&LEASE_ID, &landlord, &reason);
+
+    // Verify lease is paused
+    let (paused, pause_reason, _, _) = client.get_pause_status(&LEASE_ID).unwrap();
+    assert!(paused);
+    assert_eq!(pause_reason.unwrap(), reason);
+}
+
+#[test]
+fn test_emergency_pause_rent_by_arbitrator() {
+    let env = make_env();
+    let (_, client) = setup(&env);
+    let admin = Address::generate(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let arbitrator = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // Setup
+    client.set_admin(&admin);
+    client.add_allowed_asset(&admin, &token);
+
+    let mut arbitrators = soroban_sdk::Vec::new(&env);
+    arbitrators.push_back(arbitrator.clone());
+
+    let params = CreateLeaseParams {
+        tenant: tenant.clone(),
+        rent_amount: 1000,
+        deposit_amount: 500,
+        security_deposit: 500,
+        start_date: START,
+        end_date: END,
+        property_uri: String::from_str(&env, "ipfs://test"),
+        payment_token: token,
+        rent_per_sec: 1,
+        grace_period_end: END,
+        late_fee_flat: 100,
+        late_fee_per_sec: 2,
+        arbitrators,
+    };
+
+    client.create_lease_instance(&LEASE_ID, &landlord, &params);
+
+    // Test arbitrator can pause rent
+    let reason = String::from_str(&env, "Hurricane - mandatory evacuation");
+    client.emergency_pause_rent(&LEASE_ID, &arbitrator, &reason);
+
+    // Verify lease is paused
+    let (paused, _, _, _) = client.get_pause_status(&LEASE_ID).unwrap();
+    assert!(paused);
+}
+
+#[test]
+fn test_emergency_pause_rent_unauthorized() {
+    let env = make_env();
+    let (_, client) = setup(&env);
+    let admin = Address::generate(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let unauthorized = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // Setup
+    client.set_admin(&admin);
+    client.add_allowed_asset(&admin, &token);
+
+    let params = CreateLeaseParams {
+        tenant: tenant.clone(),
+        rent_amount: 1000,
+        deposit_amount: 500,
+        security_deposit: 500,
+        start_date: START,
+        end_date: END,
+        property_uri: String::from_str(&env, "ipfs://test"),
+        payment_token: token,
+        rent_per_sec: 1,
+        grace_period_end: END,
+        late_fee_flat: 100,
+        late_fee_per_sec: 2,
+        arbitrators: soroban_sdk::Vec::new(&env),
+    };
+
+    client.create_lease_instance(&LEASE_ID, &landlord, &params);
+
+    // Test unauthorized user cannot pause rent
+    let reason = String::from_str(&env, "Unauthorized pause attempt");
+    let result = client.try_emergency_pause_rent(&LEASE_ID, &unauthorized, &reason);
+    assert_eq!(result, Err(Ok(LeaseError::Unauthorised)));
+}
+
+#[test]
+fn test_emergency_pause_rent_already_paused() {
+    let env = make_env();
+    let (_, client) = setup(&env);
+    let admin = Address::generate(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // Setup
+    client.set_admin(&admin);
+    client.add_allowed_asset(&admin, &token);
+
+    let params = CreateLeaseParams {
+        tenant: tenant.clone(),
+        rent_amount: 1000,
+        deposit_amount: 500,
+        security_deposit: 500,
+        start_date: START,
+        end_date: END,
+        property_uri: String::from_str(&env, "ipfs://test"),
+        payment_token: token,
+        rent_per_sec: 1,
+        grace_period_end: END,
+        late_fee_flat: 100,
+        late_fee_per_sec: 2,
+        arbitrators: soroban_sdk::Vec::new(&env),
+    };
+
+    client.create_lease_instance(&LEASE_ID, &landlord, &params);
+
+    // Pause rent first time
+    let reason1 = String::from_str(&env, "First pause");
+    client.emergency_pause_rent(&LEASE_ID, &admin, &reason1);
+
+    // Try to pause again
+    let reason2 = String::from_str(&env, "Second pause");
+    let result = client.try_emergency_pause_rent(&LEASE_ID, &admin, &reason2);
+    assert_eq!(result, Err(Ok(LeaseError::LeaseAlreadyPaused)));
+}
+
+#[test]
+fn test_emergency_resume_rent() {
+    let env = make_env();
+    let (_, client) = setup(&env);
+    let admin = Address::generate(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // Setup
+    client.set_admin(&admin);
+    client.add_allowed_asset(&admin, &token);
+
+    let params = CreateLeaseParams {
+        tenant: tenant.clone(),
+        rent_amount: 1000,
+        deposit_amount: 500,
+        security_deposit: 500,
+        start_date: START,
+        end_date: END,
+        property_uri: String::from_str(&env, "ipfs://test"),
+        payment_token: token,
+        rent_per_sec: 1,
+        grace_period_end: END,
+        late_fee_flat: 100,
+        late_fee_per_sec: 2,
+        arbitrators: soroban_sdk::Vec::new(&env),
+    };
+
+    client.create_lease_instance(&LEASE_ID, &landlord, &params);
+
+    // Pause rent
+    let reason = String::from_str(&env, "Emergency pause");
+    client.emergency_pause_rent(&LEASE_ID, &admin, &reason);
+
+    // Fast forward 1 day
+    env.ledger().with_mut(|l| l.timestamp = START + 86400);
+
+    // Resume rent
+    client.emergency_resume_rent(&LEASE_ID, &admin);
+
+    // Verify lease is no longer paused
+    let (paused, _, _, total_paused_duration) = client.get_pause_status(&LEASE_ID).unwrap();
+    assert!(!paused);
+    assert_eq!(total_paused_duration, 86400); // 1 day
+
+    // Verify lease status changed back to Active
+    let lease = client.get_lease_instance(&LEASE_ID).unwrap();
+    assert_eq!(lease.status, LeaseStatus::Active);
+}
+
+#[test]
+fn test_emergency_resume_rent_not_paused() {
+    let env = make_env();
+    let (_, client) = setup(&env);
+    let admin = Address::generate(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // Setup
+    client.set_admin(&admin);
+    client.add_allowed_asset(&admin, &token);
+
+    let params = CreateLeaseParams {
+        tenant: tenant.clone(),
+        rent_amount: 1000,
+        deposit_amount: 500,
+        security_deposit: 500,
+        start_date: START,
+        end_date: END,
+        property_uri: String::from_str(&env, "ipfs://test"),
+        payment_token: token,
+        rent_per_sec: 1,
+        grace_period_end: END,
+        late_fee_flat: 100,
+        late_fee_per_sec: 2,
+        arbitrators: soroban_sdk::Vec::new(&env),
+    };
+
+    client.create_lease_instance(&LEASE_ID, &landlord, &params);
+
+    // Try to resume rent without pausing first
+    let result = client.try_emergency_resume_rent(&LEASE_ID, &admin);
+    assert_eq!(result, Err(Ok(LeaseError::LeaseNotPaused)));
+}
+
+#[test]
+fn test_rent_calculation_with_pause() {
+    let env = make_env();
+    let (_, client) = setup(&env);
+    let admin = Address::generate(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // Setup
+    client.set_admin(&admin);
+    client.add_allowed_asset(&admin, &token);
+
+    let rent_per_sec = 1i128; // 1 unit per second for easy calculation
+    let params = CreateLeaseParams {
+        tenant: tenant.clone(),
+        rent_amount: 1000,
+        deposit_amount: 500,
+        security_deposit: 500,
+        start_date: START,
+        end_date: END,
+        property_uri: String::from_str(&env, "ipfs://test"),
+        payment_token: token,
+        rent_per_sec,
+        grace_period_end: END,
+        late_fee_flat: 100,
+        late_fee_per_sec: 2,
+        arbitrators: soroban_sdk::Vec::new(&env),
+    };
+
+    client.create_lease_instance(&LEASE_ID, &landlord, &params);
+
+    // Fast forward 1000 seconds (should owe 1000 units)
+    env.ledger().with_mut(|l| l.timestamp = START + 1000);
+    let debt_before_pause = client.check_tenant_default(&LEASE_ID).unwrap();
+    assert_eq!(debt_before_pause, 1000);
+
+    // Pause rent
+    let reason = String::from_str(&env, "Emergency pause");
+    client.emergency_pause_rent(&LEASE_ID, &admin, &reason);
+
+    // Fast forward another 1000 seconds while paused
+    env.ledger().with_mut(|l| l.timestamp = START + 2000);
+    let debt_during_pause = client.check_tenant_default(&LEASE_ID).unwrap();
+    // Debt should still be 1000 (no accrual during pause)
+    assert_eq!(debt_during_pause, 1000);
+
+    // Resume rent
+    client.emergency_resume_rent(&LEASE_ID, &admin);
+
+    // Fast forward another 500 seconds after resume
+    env.ledger().with_mut(|l| l.timestamp = START + 2500);
+    let debt_after_resume = client.check_tenant_default(&LEASE_ID).unwrap();
+    // Debt should be 1000 (before pause) + 500 (after resume) = 1500
+    assert_eq!(debt_after_resume, 1500);
+}
+
+#[test]
+fn test_no_eviction_during_pause() {
+    let env = make_env();
+    let (_, client) = setup(&env);
+    let admin = Address::generate(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // Setup
+    client.set_admin(&admin);
+    client.add_allowed_asset(&admin, &token);
+
+    let params = CreateLeaseParams {
+        tenant: tenant.clone(),
+        rent_amount: 1000, // Eviction threshold is 2000
+        deposit_amount: 500,
+        security_deposit: 500,
+        start_date: START,
+        end_date: END,
+        property_uri: String::from_str(&env, "ipfs://test"),
+        payment_token: token,
+        rent_per_sec: 1,
+        grace_period_end: START + 100, // Short grace period
+        late_fee_flat: 100,
+        late_fee_per_sec: 2,
+        arbitrators: soroban_sdk::Vec::new(&env),
+    };
+
+    client.create_lease_instance(&LEASE_ID, &landlord, &params);
+
+    // Pause rent immediately
+    let reason = String::from_str(&env, "Emergency pause");
+    client.emergency_pause_rent(&LEASE_ID, &admin, &reason);
+
+    // Fast forward way past eviction threshold time
+    env.ledger().with_mut(|l| l.timestamp = START + 10000);
+    
+    // Check debt - should not trigger eviction event due to pause
+    let events_before = env.events().all().len();
+    let _debt = client.check_tenant_default(&LEASE_ID).unwrap();
+    let events_after = env.events().all().len();
+    
+    // No new eviction events should be emitted during pause
+    assert_eq!(events_before, events_after);
+}
+
+#[test]
+fn test_terminate_paused_lease() {
+    let env = make_env();
+    let (_, client) = setup(&env);
+    let admin = Address::generate(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // Setup
+    client.set_admin(&admin);
+    client.add_allowed_asset(&admin, &token);
+
+    let params = CreateLeaseParams {
+        tenant: tenant.clone(),
+        rent_amount: 1000,
+        deposit_amount: 500,
+        security_deposit: 500,
+        start_date: START,
+        end_date: END,
+        property_uri: String::from_str(&env, "ipfs://test"),
+        payment_token: token,
+        rent_per_sec: 1,
+        grace_period_end: END,
+        late_fee_flat: 100,
+        late_fee_per_sec: 2,
+        arbitrators: soroban_sdk::Vec::new(&env),
+    };
+
+    client.create_lease_instance(&LEASE_ID, &landlord, &params);
+
+    // Pause rent
+    let reason = String::from_str(&env, "Emergency pause");
+    client.emergency_pause_rent(&LEASE_ID, &admin, &reason);
+
+    // Settle deposit first
+    let mut lease = client.get_lease_instance(&LEASE_ID).unwrap();
+    // Manually update deposit status for test (in real scenario this would be done through proper flow)
+    env.as_contract(&env.register(LeaseContract, ()), || {
+        let mut lease = load_lease_instance_by_id(&env, LEASE_ID).unwrap();
+        lease.deposit_status = DepositStatus::Settled;
+        save_lease_instance(&env, LEASE_ID, &lease);
+    });
+
+    // Should be able to terminate paused lease even before end_date
+    client.terminate_lease(&LEASE_ID, &landlord);
+
+    // Verify lease was terminated
+    let result = client.try_get_lease_instance(&LEASE_ID);
+    assert_eq!(result, Err(Ok(LeaseError::LeaseNotFound))); // Archived
 }
