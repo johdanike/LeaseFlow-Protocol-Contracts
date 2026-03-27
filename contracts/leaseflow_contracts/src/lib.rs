@@ -162,6 +162,19 @@ pub struct CreateLeaseParams {
 }
 
 
+// #[contracttype]
+// #[derive(Clone, Debug, Eq, PartialEq)]
+// pub enum DataKey {
+//     Lease(Symbol),
+//     LeaseInstance(u64),
+//     Receipt(Symbol, u32),
+//     Admin,
+//     UsageRights(Address, u128),
+//     HistoricalLease(u64),
+//     KycProvider,
+//     AllowedAsset(Address),
+// }
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
@@ -173,6 +186,21 @@ pub enum DataKey {
     HistoricalLease(u64),
     KycProvider,
     AllowedAsset(Address),
+    AuthorizedPayer(u64, Address), 
+    RoommateBalance(u64, Address),
+}
+
+#[contractevent]
+pub struct RoommateAdded {
+    pub lease_id: u64,
+    pub roommate: Address,
+}
+
+#[contractevent]
+pub struct RentPaidPartial {
+    pub lease_id: u64,
+    pub roommate: Address,
+    pub amount: i128,
 }
 
 
@@ -599,30 +627,50 @@ impl LeaseContract {
         Ok(())
     }
 
-    pub fn pay_lease_instance_rent(env: Env, lease_id: u64, payment_amount: i128) -> Result<(), LeaseError> {
+  pub fn pay_lease_instance_rent(env: Env, lease_id: u64, payer: Address, payment_amount: i128) -> Result<(), LeaseError> {
+        payer.require_auth();
+
         let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
         require!(lease.active, "Lease is not active");
-        Self::require_kyc(&env, &lease.landlord, &lease.tenant)?;
-        Self::require_stablecoin(&env, &lease.payment_token)?;
 
-        if lease.maintenance_status == MaintenanceStatus::Reported || lease.maintenance_status == MaintenanceStatus::Fixed {
-            lease.withheld_rent += payment_amount;
-        } else {
-            lease.cumulative_payments += payment_amount;
-            lease.rent_paid += payment_amount;
+        let is_primary = payer == lease.tenant;
+        let is_authorized = env.storage().persistent().get::<_, bool>(&DataKey::AuthorizedPayer(lease_id, payer.clone())).unwrap_or(false);
+        if !is_primary && !is_authorized {
+            return Err(LeaseError::Unauthorised);
         }
+
+        let balance_key = DataKey::RoommateBalance(lease_id, payer.clone());
+        let mut payer_bal: i128 = env.storage().persistent().get(&balance_key).unwrap_or(0);
+        payer_bal += payment_amount;
+        env.storage().persistent().set(&balance_key, &payer_bal);
+        env.storage().persistent().extend_ttl(&balance_key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+
+        lease.cumulative_payments += payment_amount;
+        lease.rent_paid += payment_amount;
+
+        let token_client = soroban_sdk::token::Client::new(&env, &lease.payment_token);
+        token_client.transfer(
+            &payer, 
+            &env.current_contract_address(), 
+            &payment_amount
+        );
+
+        RentPaidPartial { lease_id, roommate: payer.clone(), amount: payment_amount }.publish(&env);
+
         if let Some(buyout_price) = lease.buyout_price {
-            if lease.cumulative_payments >= buyout_price && (lease.maintenance_status == MaintenanceStatus::None || lease.maintenance_status == MaintenanceStatus::Verified) {
+            if lease.cumulative_payments >= buyout_price {
                 lease.active = false;
                 lease.status = LeaseStatus::Terminated;
                 if let (Some(nft), Some(id)) = (&lease.nft_contract, &lease.token_id) {
                     let client = nft_contract::NftClient::new(&env, nft);
+                    // Transfers NFT to the primary tenant upon buyout completion
                     client.transfer_from(&env.current_contract_address(), &env.current_contract_address(), &lease.tenant, id);
                 }
                 archive_lease(&env, lease_id, lease.clone(), env.current_contract_address());
                 return Ok(());
             }
         }
+        
         save_lease_instance(&env, lease_id, &lease);
         Ok(())
     }
@@ -1011,6 +1059,32 @@ impl LeaseContract {
 
         save_lease(&env, lease_id, &lease);
         Ok(total_debt)
+    }
+
+    /// Authorizes an additional roommate to make payments towards a lease.
+    pub fn add_authorized_payer(env: Env, lease_id: u64, landlord: Address, roommate: Address) -> Result<(), LeaseError> {
+        let lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        // Only the landlord can authorize new payers to the lease
+        if lease.landlord != landlord { 
+            return Err(LeaseError::Unauthorised); 
+        }
+        landlord.require_auth();
+
+        // Save the roommate to persistent storage
+        let key = DataKey::AuthorizedPayer(lease_id, roommate.clone());
+        env.storage().persistent().set(&key, &true);
+        env.storage().persistent().extend_ttl(&key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+
+        RoommateAdded { lease_id, roommate }.publish(&env);
+        Ok(())
+    }
+
+    pub fn get_roommate_balance(env: Env, lease_id: u64, roommate: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RoommateBalance(lease_id, roommate))
+            .unwrap_or(0)
     }
 }
 
