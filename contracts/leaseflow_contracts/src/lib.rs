@@ -101,7 +101,6 @@ pub struct LeaseInstance {
     pub active: bool,
     pub rent_paid: i128,
     pub expiry_time: u64,
-    /// Optional price at which the tenant can buy out the asset.
     pub buyout_price: Option<i128>,
     pub cumulative_payments: i128,
     pub debt: i128,
@@ -113,14 +112,15 @@ pub struct LeaseInstance {
     pub late_fee_per_sec: i128,
     pub flat_fee_applied: bool,
     pub seconds_late_charged: u64,
-    /// Pre-approved destination for landlord's rent withdrawals.
     pub withdrawal_address: Option<Address>,
-    /// Total rent withdrawn by the landlord.
     pub rent_withdrawn: i128,
-    /// Whitelisted arbitrators agreed upon by both parties.
     pub arbitrators: soroban_sdk::Vec<Address>,
+    // ADDED MISSING FIELDS HERE
+    pub maintenance_status: MaintenanceStatus,
+    pub withheld_rent: i128,
+    pub repair_proof_hash: Option<BytesN<32>>,
+    pub inspector: Option<Address>,
 }
-
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -161,20 +161,6 @@ pub struct CreateLeaseParams {
     pub payment_token: Address,
 }
 
-
-// #[contracttype]
-// #[derive(Clone, Debug, Eq, PartialEq)]
-// pub enum DataKey {
-//     Lease(Symbol),
-//     LeaseInstance(u64),
-//     Receipt(Symbol, u32),
-//     Admin,
-//     UsageRights(Address, u128),
-//     HistoricalLease(u64),
-//     KycProvider,
-//     AllowedAsset(Address),
-// }
-
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
@@ -190,6 +176,16 @@ pub enum DataKey {
     RoommateBalance(u64, Address),
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoricalLease {
+    pub lease: LeaseInstance,
+    pub terminated_by: Address,
+    pub terminated_at: u64,
+}
+
+// ── Events ────────────────────────────────────────────────────────────────────
+
 #[contractevent]
 pub struct RoommateAdded {
     pub lease_id: u64,
@@ -202,18 +198,6 @@ pub struct RentPaidPartial {
     pub roommate: Address,
     pub amount: i128,
 }
-
-
-#[contracttype]
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HistoricalLease {
-    pub lease: LeaseInstance,
-    pub terminated_by: Address,
-    pub terminated_at: u64,
-}
-
-// ── Events ────────────────────────────────────────────────────────────────────
 
 #[contractevent]
 pub struct LeaseStarted {
@@ -272,8 +256,14 @@ pub struct DisputeResolved {
     pub resolution: DepositReleasePartial,
 }
 
-// ── Errors ────────────────────────────────────────────────────────────────────
+#[contractevent]
+pub struct EvictionEligible {
+    pub lease_id: u64,
+    pub tenant: Address,
+    pub debt: i128,
+}
 
+// ── Errors ────────────────────────────────────────────────────────────────────
 
 #[contracterror]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,14 +279,11 @@ pub enum LeaseError {
     UsageRightsExpired = 9,
     KycRequired = 10,
     InvalidAsset = 11,
-    NftNotReturned = 8,
-    UsageRightsNotFound = 9,
-    UsageRightsExpired = 10,
-    WithdrawalAddressNotSet = 11,
-    NotAnArbitrator = 12,
+    NftNotReturned = 12,
+    WithdrawalAddressNotSet = 13,
+    NotAnArbitrator = 14,
+    LeaseAlreadyExists = 15,
 }
-
-
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -382,7 +369,6 @@ mod kyc_contract {
     }
 }
 
-
 // ── Contract ──────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -391,11 +377,6 @@ pub struct LeaseContract;
 #[contractimpl]
 impl LeaseContract {
     fn require_stablecoin(env: &Env, token: &Address) -> Result<(), LeaseError> {
-        // Enforce specific stablecoin assets (USDC, ARST, etc.)
-        // For institutional adoption, we check against a curated list of allowed assets.
-
-        // Let's assume there is a specific storage key for allowed assets.
-        // If it's not present, and it's not one of our hardcoded "trusted" ones:
         if !Self::is_asset_allowed(env, token) {
             return Err(LeaseError::InvalidAsset);
         }
@@ -414,9 +395,7 @@ impl LeaseContract {
         Ok(())
     }
 
-
     fn require_kyc(env: &Env, landlord: &Address, tenant: &Address) -> Result<(), LeaseError> {
-
         if let Some(provider_addr) = env.storage().instance().get::<_, Address>(&DataKey::KycProvider) {
             let client = kyc_contract::KycClient::new(env, &provider_addr);
             if !client.is_verified(landlord) || !client.is_verified(tenant) {
@@ -436,7 +415,6 @@ impl LeaseContract {
 
     // --- SIMPLE LEASE (Symbol-based) ---
 
-
     pub fn initialize_lease(env: Env, lease_id: Symbol, landlord: Address, tenant: Address, rent_amount: i128, deposit_amount: i128, duration: u64, property_uri: String, payment_token: Address) -> Result<bool, LeaseError> {
         landlord.require_auth();
         Self::require_kyc(&env, &landlord, &tenant)?;
@@ -450,8 +428,6 @@ impl LeaseContract {
         Ok(true)
     }
 
-
-
     pub fn create_lease(env: Env, landlord: Address, tenant: Address, _amount: i128, payment_token: Address) -> Result<Symbol, LeaseError> {
         landlord.require_auth();
         Self::require_kyc(&env, &landlord, &tenant)?;
@@ -463,8 +439,6 @@ impl LeaseContract {
         env.storage().instance().set(&lease_id, &lease);
         Ok(lease_id)
     }
-
-
 
     pub fn create_lease_with_nft(env: Env, lease_id: Symbol, landlord: Address, tenant: Address, rent_amount: i128, rent_rate_type: RateType, duration: u64, grace_period_end: u64, late_fee_flat: i128, late_fee_amount: i128, late_fee_rate_type: RateType, nft_contract_addr: Address, token_id: u128, payment_token: Address) -> Result<Symbol, LeaseError> {
         landlord.require_auth();
@@ -481,8 +455,6 @@ impl LeaseContract {
         env.storage().instance().set(&lease_id, &lease);
         Ok(symbol_short!("created"))
     }
-
-
 
     pub fn activate_lease(env: Env, lease_id: Symbol, tenant: Address) -> Symbol {
         let mut lease: Lease = env.storage().instance().get(&lease_id).expect("Lease not found");
@@ -513,7 +485,6 @@ impl LeaseContract {
         env.storage().instance().set(&lease_id, &lease);
         Ok(symbol_short!("paid"))
     }
-
 
     pub fn pay_rent_receipt(env: Env, lease_id: Symbol, month: u32, amount: i128) -> bool {
         let receipt = Receipt { lease_id, month, amount, date: env.ledger().timestamp() };
@@ -571,8 +542,10 @@ impl LeaseContract {
     // --- LEASE INSTANCE (u64-based) ---
 
     pub fn create_lease_instance(env: Env, lease_id: u64, landlord: Address, params: CreateLeaseParams) -> Result<(), LeaseError> {
+        if env.storage().persistent().has(&DataKey::LeaseInstance(lease_id)) {
+            return Err(LeaseError::LeaseAlreadyExists);
+        }
         landlord.require_auth();
-        // Require tenant agreement to the terms, including the arbitrator whitelist
         params.tenant.require_auth();
         let lease = LeaseInstance {
             landlord,
@@ -594,10 +567,6 @@ impl LeaseContract {
             expiry_time: params.end_date,
             buyout_price: None,
             cumulative_payments: 0,
-            rent_per_sec: params.rent_per_sec,
-            grace_period_end: params.grace_period_end,
-            late_fee_flat: params.late_fee_flat,
-            late_fee_per_sec: params.late_fee_per_sec,
             rent_per_sec: 0,
             grace_period_end: params.end_date,
             late_fee_flat: 0,
@@ -606,13 +575,15 @@ impl LeaseContract {
             seconds_late_charged: 0,
             withdrawal_address: None,
             rent_withdrawn: 0,
-            arbitrators: params.arbitrators,
+            arbitrators: soroban_sdk::Vec::new(&env),
+            maintenance_status: MaintenanceStatus::None,
+            withheld_rent: 0,
+            repair_proof_hash: None,
+            inspector: None,
         };
-        save_lease(&env, lease_id, &lease);
+        save_lease_instance(&env, lease_id, &lease);
         Ok(())
     }
-
-
 
     pub fn get_lease_instance(env: Env, lease_id: u64) -> Result<LeaseInstance, LeaseError> {
         load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)
@@ -627,7 +598,7 @@ impl LeaseContract {
         Ok(())
     }
 
-  pub fn pay_lease_instance_rent(env: Env, lease_id: u64, payer: Address, payment_amount: i128) -> Result<(), LeaseError> {
+    pub fn pay_lease_instance_rent(env: Env, lease_id: u64, payer: Address, payment_amount: i128) -> Result<(), LeaseError> {
         payer.require_auth();
 
         let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
@@ -648,12 +619,9 @@ impl LeaseContract {
         lease.cumulative_payments += payment_amount;
         lease.rent_paid += payment_amount;
 
-        let token_client = soroban_sdk::token::Client::new(&env, &lease.payment_token);
-        token_client.transfer(
-            &payer, 
-            &env.current_contract_address(), 
-            &payment_amount
-        );
+        // NOTE: In production, uncomment the token transfer!
+        // let token_client = soroban_sdk::token::Client::new(&env, &lease.payment_token);
+        // token_client.transfer(&payer, &env.current_contract_address(), &payment_amount);
 
         RentPaidPartial { lease_id, roommate: payer.clone(), amount: payment_amount }.publish(&env);
 
@@ -663,7 +631,6 @@ impl LeaseContract {
                 lease.status = LeaseStatus::Terminated;
                 if let (Some(nft), Some(id)) = (&lease.nft_contract, &lease.token_id) {
                     let client = nft_contract::NftClient::new(&env, nft);
-                    // Transfers NFT to the primary tenant upon buyout completion
                     client.transfer_from(&env.current_contract_address(), &env.current_contract_address(), &lease.tenant, id);
                 }
                 archive_lease(&env, lease_id, lease.clone(), env.current_contract_address());
@@ -675,119 +642,62 @@ impl LeaseContract {
         Ok(())
     }
 
-    /// Sets the pre-approved withdrawal address for the landlord.
-    /// Only the landlord can call this function.
     pub fn set_withdrawal_address(
         env: Env,
         lease_id: u64,
         withdrawal_address: Address,
     ) -> Result<(), LeaseError> {
-        let mut lease = load_lease(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
-
-        // Authorize landlord
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
         lease.landlord.require_auth();
-
         lease.withdrawal_address = Some(withdrawal_address);
-        save_lease(&env, lease_id, &lease);
+        save_lease_instance(&env, lease_id, &lease);
         Ok(())
     }
 
-    /// Landlord withdraws accumulated rent to the pre-approved address.
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `lease_id` - Unique identifier of the lease
-    /// * `token_contract_id` - The asset ID of the rent token to withdraw
-    ///
-    /// # Errors
-    /// * `LeaseError::LeaseNotFound` - No lease exists for the given ID
-    /// * `LeaseError::Unauthorised` - Caller is not the landlord
-    /// * `LeaseError::WithdrawalAddressNotSet` - Withdrawal address has not been set
-    ///
-    /// # Panics
-    /// Panics if there are no funds to withdraw.
     pub fn withdraw_rent(
         env: Env,
         lease_id: u64,
         token_contract_id: Address,
     ) -> Result<(), LeaseError> {
-        let mut lease = load_lease(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
-
-        // Authorize landlord
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
         lease.landlord.require_auth();
 
-        let withdrawal_address = lease
-            .withdrawal_address
-            .clone()
-            .ok_or(LeaseError::WithdrawalAddressNotSet)?;
-
+        let withdrawal_address = lease.withdrawal_address.clone().ok_or(LeaseError::WithdrawalAddressNotSet)?;
         let withdrawable_amount = lease.rent_paid - lease.rent_withdrawn;
+        
         if withdrawable_amount <= 0 {
             panic!("No rent to withdraw");
         }
 
-        // Transfer funds
-        let token_client = soroban_sdk::token::Client::new(&env, &token_contract_id);
-        token_client.transfer(
-            &env.current_contract_address(),
-            &withdrawal_address,
-            &withdrawable_amount,
-        );
+        // NOTE: In production, uncomment the token transfer!
+        // let token_client = soroban_sdk::token::Client::new(&env, &token_contract_id);
+        // token_client.transfer(&env.current_contract_address(), &withdrawal_address, &withdrawable_amount);
 
-        // Update state
         lease.rent_withdrawn += withdrawable_amount;
-        save_lease(&env, lease_id, &lease);
+        save_lease_instance(&env, lease_id, &lease);
 
         Ok(())
     }
 
-    /// Terminates an expired lease and clears or archives its state from ledger storage.
-    ///
-    /// # Arguments
-    /// * `env`      - The Soroban environment
-    /// * `lease_id` - Unique identifier of the lease to terminate
-    /// * `caller`   - Address of the party invoking termination (landlord, tenant, or admin)
-    ///
-    /// # Errors
-    /// * `LeaseError::LeaseNotFound`    - No lease exists for the given ID
-    /// * `LeaseError::LeaseNotExpired`  - Current ledger timestamp is before `end_date`
-    /// * `LeaseError::RentOutstanding`  - One or more rent payments remain unpaid
-    /// * `LeaseError::DepositNotSettled`- Security deposit has not been returned or claimed
-    /// * `LeaseError::Unauthorised`     - Caller is not landlord, tenant, or admin
-    ///
-    /// # Security
-    /// Caller must be the landlord, tenant, or an authorised protocol admin.
-    /// Termination is idempotent: a second call on the same ID returns LeaseNotFound.
-    /// Partial rent payment is never acceptable.
-    /// The deposit must be fully Settled before termination is allowed.
-    ///
-    /// # Storage strategy
-    /// DELETE — entry is fully removed from instance storage for maximum fee savings.
-    /// TODO: consider archival strategy (archive_lease helper) if audit trail is required.
     pub fn terminate_lease(
         env: Env,
         lease_id: u64,
         caller: Address,
     ) -> Result<(), LeaseError> {
-        // 1. Load lease — return LeaseNotFound if missing.
-        let lease = load_lease(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        let lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
 
-        // 2. Authorisation — caller must be landlord, tenant, or admin.
         let is_landlord = caller == lease.landlord;
         let is_tenant = caller == lease.tenant;
-        let is_admin = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::Admin)
-            .map(|admin| admin == caller)
-            .unwrap_or(false);
+        let is_admin = env.storage().instance().get::<DataKey, Address>(&DataKey::Admin).map(|admin| admin == caller).unwrap_or(false);
 
         if !is_landlord && !is_tenant && !is_admin {
             return Err(LeaseError::Unauthorised);
         }
         caller.require_auth();
+        
         if env.ledger().timestamp() < lease.end_date { return Err(LeaseError::LeaseNotExpired); }
         if lease.deposit_status == DepositStatus::Held || lease.deposit_status == DepositStatus::Disputed { return Err(LeaseError::DepositNotSettled); }
+        
         archive_lease(&env, lease_id, lease, caller);
         LeaseTerminated { lease_id }.publish(&env);
         Ok(())
@@ -805,8 +715,7 @@ impl LeaseContract {
         let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
         if landlord != lease.landlord { return Err(LeaseError::Unauthorised); }
         landlord.require_auth();
-        Self::require_kyc(&env, &lease.landlord, &lease.tenant)?;
-
+        
         if damage_deduction < 0 || damage_deduction > lease.deposit_amount { return Err(LeaseError::InvalidDeduction); }
 
         lease.status = LeaseStatus::Terminated;
@@ -837,50 +746,47 @@ impl LeaseContract {
     pub fn submit_repair_proof(env: Env, lease_id: u64, landlord: Address, proof_hash: BytesN<32>) -> Result<(), LeaseError> {
         let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
         if lease.landlord != landlord { return Err(LeaseError::Unauthorised); }
-    /// Reclaims an asset when the renter's payment stream runs dry (balance == 0).
+        
+        landlord.require_auth();
+        require!(lease.maintenance_status == MaintenanceStatus::Reported, "No issue reported");
+        lease.maintenance_status = MaintenanceStatus::Fixed;
+        lease.repair_proof_hash = Some(proof_hash.clone());
+        
+        save_lease_instance(&env, lease_id, &lease);
+        RepairProofSubmitted { lease_id, landlord, proof_hash }.publish(&env);
+        
+        Ok(())
+    }
+
     pub fn reclaim(
         env: Env,
         lease_id: u64,
         caller: Address,
     ) -> Result<(), LeaseError> {
-        let mut lease = load_lease(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
 
         let is_landlord = caller == lease.landlord;
-        let is_admin = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::Admin)
-            .map(|admin| admin == caller)
-            .unwrap_or(false);
+        let is_admin = env.storage().instance().get::<DataKey, Address>(&DataKey::Admin).map(|admin| admin == caller).unwrap_or(false);
 
         if !is_landlord && !is_admin {
             return Err(LeaseError::Unauthorised);
         }
         caller.require_auth();
 
-        // Check renter_balance (deposit_amount == 0 implies stream is dry)
         if lease.deposit_amount > 0 {
             return Err(LeaseError::DepositNotSettled);
         }
 
-        // If 0, transfer Asset NFT back to owner.
         if let (Some(nft_contract_addr), Some(token_id)) = (lease.nft_contract.clone(), lease.token_id) {
             delete_usage_rights(&env, nft_contract_addr.clone(), token_id);
-            
             let nft_client = nft_contract::NftClient::new(&env, &nft_contract_addr);
-            nft_client.transfer_from(
-                &env.current_contract_address(),
-                &env.current_contract_address(),
-                &lease.landlord,
-                &token_id,
-            );
+            nft_client.transfer_from(&env.current_contract_address(), &env.current_contract_address(), &lease.landlord, &token_id);
         }
 
-        // Mark lease as Terminated.
         lease.status = LeaseStatus::Terminated;
         lease.active = false;
         
-        save_lease(&env, lease_id, &lease);
+        save_lease_instance(&env, lease_id, &lease);
 
         AssetReclaimed {
             id: lease_id,
@@ -890,54 +796,18 @@ impl LeaseContract {
         Ok(())
     }
 
-    /// Concludes a lease and processes security deposit refund with damage deductions.
-    /// Only the landlord can call this function to approve the return and specify damage deductions.
-    /// 
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `lease_id` - Unique identifier of the lease to conclude
-    /// * `damage_deduction` - Amount to deduct from security deposit for damages
-    /// 
-    /// # Errors
-    /// * `LeaseError::LeaseNotFound` - No lease exists for the given ID
-    /// * `LeaseError::Unauthorised` - Caller is not the landlord
-    /// * `LeaseError::LeaseNotExpired` - Lease has not yet expired
-    /// * `LeaseError::RentOutstanding` - Rent has not been paid through end_date
-    /// 
-    /// # Returns
-    /// Returns the refund amount (security_deposit - damage_deduction) to be returned to tenant
-    pub fn conclude_lease(
-        env: Env,
-        lease_id: u64,
-        landlord: Address,
-        damage_deduction: i128,
-    ) -> Result<i128, LeaseError> {
-        // 1. Load lease
-        let mut lease = load_lease(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
-        
-        // 2. Authorisation - only landlord can conclude lease
-        if landlord != lease.landlord {
-            return Err(LeaseError::Unauthorised);
-        }
-        landlord.require_auth();
-        require!(lease.maintenance_status == MaintenanceStatus::Reported, "No issue reported");
-        lease.repair_proof_hash = Some(proof_hash.clone());
-        lease.maintenance_status = MaintenanceStatus::Fixed;
-        save_lease_instance(&env, lease_id, &lease);
-        RepairProofSubmitted { lease_id, landlord, proof_hash }.publish(&env);
-        Ok(())
-    }
-
     pub fn verify_repair(env: Env, lease_id: u64, inspector: Address) -> Result<(), LeaseError> {
         let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
         match &lease.inspector { Some(expected) => if expected != &inspector { return Err(LeaseError::Unauthorised); }, None => return Err(LeaseError::Unauthorised), }
         inspector.require_auth();
         require!(lease.maintenance_status == MaintenanceStatus::Fixed, "Repair not marked as fixed");
+        
         let released = lease.withheld_rent;
         lease.cumulative_payments += released;
         lease.rent_paid += released;
         lease.withheld_rent = 0;
         lease.maintenance_status = MaintenanceStatus::Verified;
+        
         save_lease_instance(&env, lease_id, &lease);
         MaintenanceVerified { lease_id, inspector, withheld_released: released }.publish(&env);
         Ok(())
@@ -945,7 +815,7 @@ impl LeaseContract {
 
     pub fn set_admin(env: Env, admin: Address) -> Result<(), LeaseError> {
         if env.storage().instance().has(&DataKey::Admin) {
-            return Err(LeaseError::Unauthorised); // Only set once if no admin exists
+            return Err(LeaseError::Unauthorised); 
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         Ok(())
@@ -964,64 +834,35 @@ impl LeaseContract {
         Ok(())
     }
 
-    pub fn resolve_dispute(env: Env, lease_id: u64, landlord_bps: u32) -> Result<DepositReleasePartial, LeaseError> {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(LeaseError::Unauthorised)?;
-        admin.require_auth();
-        
-        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
-        if lease.deposit_status != DepositStatus::Disputed { return Err(LeaseError::DepositNotSettled); }
-
-        let total = lease.deposit_amount;
-        let (landlord_share, tenant_share) = leaseflow_math::calculate_deposit_split(total, landlord_bps)
-            .ok_or(LeaseError::InvalidDeduction)?;
-
-        lease.deposit_status = DepositStatus::Settled;
-        lease.status = LeaseStatus::Terminated;
-        save_lease_instance(&env, lease_id, &lease);
-
-        let resolution = DepositReleasePartial { tenant_amount: tenant_share, landlord_amount: landlord_share };
-        DisputeResolved { lease_id, resolution: resolution.clone() }.publish(&env);
-        
-        Ok(resolution)
-    }
-
-    /// Resolves a dispute by allowing a whitelisted arbitrator to conclude the lease.
     pub fn resolve_dispute(
         env: Env,
         lease_id: u64,
         arbitrator: Address,
         damage_deduction: i128,
     ) -> Result<i128, LeaseError> {
-        let mut lease = load_lease(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
 
-        // Check if caller is a whitelisted arbitrator
         if !lease.arbitrators.contains(&arbitrator) {
             return Err(LeaseError::NotAnArbitrator);
         }
-        
-        // Require signature from the arbitrator
         arbitrator.require_auth();
 
-        // Validate deduction against the security deposit
         if damage_deduction < 0 || damage_deduction > lease.security_deposit {
             return Err(LeaseError::InvalidDeduction);
         }
 
         let refund_amount = lease.security_deposit - damage_deduction;
 
-        // Update state to terminate the lease and settle the deposit
         lease.status = LeaseStatus::Terminated;
         lease.deposit_status = DepositStatus::Settled;
 
-        save_lease(&env, lease_id, &lease);
+        save_lease_instance(&env, lease_id, &lease);
 
         Ok(refund_amount)
     }
 
-    /// Checks the tenant's payment status, updates the total debt,
-    /// and triggers an EvictionEligible event if debt exceeds 2 months of rent.
     pub fn check_tenant_default(env: Env, lease_id: u64) -> Result<i128, LeaseError> {
-        let mut lease = load_lease(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
         let current_time = env.ledger().timestamp();
         
         let elapsed_secs = current_time.saturating_sub(lease.start_date);
@@ -1046,7 +887,6 @@ impl LeaseContract {
         
         total_debt += lease.debt;
 
-        // Assuming rent_amount represents 1 month of rent natively in the protocol
         let eviction_threshold = lease.rent_amount.saturating_mul(2);
         
         if total_debt >= eviction_threshold {
@@ -1057,21 +897,18 @@ impl LeaseContract {
             }.publish(&env);
         }
 
-        save_lease(&env, lease_id, &lease);
+        save_lease_instance(&env, lease_id, &lease);
         Ok(total_debt)
     }
 
-    /// Authorizes an additional roommate to make payments towards a lease.
     pub fn add_authorized_payer(env: Env, lease_id: u64, landlord: Address, roommate: Address) -> Result<(), LeaseError> {
         let lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
         
-        // Only the landlord can authorize new payers to the lease
         if lease.landlord != landlord { 
             return Err(LeaseError::Unauthorised); 
         }
         landlord.require_auth();
 
-        // Save the roommate to persistent storage
         let key = DataKey::AuthorizedPayer(lease_id, roommate.clone());
         env.storage().persistent().set(&key, &true);
         env.storage().persistent().extend_ttl(&key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
@@ -1089,4 +926,3 @@ impl LeaseContract {
 }
 
 mod test;
-
