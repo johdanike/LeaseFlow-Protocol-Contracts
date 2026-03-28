@@ -835,7 +835,7 @@ impl LeaseContract {
     }
 
     pub fn get_lease_instance(env: Env, lease_id: u64) -> Result<LeaseInstance, LeaseError> {
-        load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)
+        load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound);
     }
 
     pub fn set_lease_instance_buyout_price(
