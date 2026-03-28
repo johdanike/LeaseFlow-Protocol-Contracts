@@ -7,6 +7,10 @@ members = [
 [workspace.dependencies]
 soroban-sdk = "25"
 
+[workspace.metadata.audit]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+
 [profile.release]
 opt-level = "z"
 overflow-checks = true
