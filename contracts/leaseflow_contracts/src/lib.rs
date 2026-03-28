@@ -817,6 +817,11 @@ impl LeaseContract {
             inspector: None,
         };
         save_lease_instance(&env, lease_id, &lease);
+        LeaseSigned {
+            lease_id,
+            property_hash: params.property_uri.clone(),
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -1236,6 +1241,14 @@ impl LeaseContract {
                 lease.debt += (newly_accrued as i128) * lease.late_fee_per_sec;
                 lease.seconds_late_charged = seconds_late;
             }
+
+            let days_late = seconds_late / 86_400;
+            PaymentLate {
+                lease_id,
+                days_late,
+                current_fine: lease.debt,
+            }
+            .publish(&env);
         }
 
         total_debt += lease.debt;
