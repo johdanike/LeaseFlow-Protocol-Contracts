@@ -38,39 +38,11 @@ pub enum LeaseStatus {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum UtilityBillStatus {
-    Pending,
-    Paid,
-    Expired,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SubletStatus {
-    Inactive,
-    Active,
-    Terminated,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MaintenanceStatus {
     None,
     Reported,
     Fixed,
     Verified,
-}
-
-// [ISSUE 38] Multi-Sig Maintenance Fund Treasury
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MaintenanceFund {
-    pub fund_address: Address,
-    pub signatories: soroban_sdk::Vec<Address>,
-    pub threshold: u32, // Number of signatures required
-    pub total_collected: i128,
-    pub total_withdrawn: i128,
-    pub maintenance_percentage_bps: u32, // Default 1000 = 10%
 }
 
 #[contracttype]
@@ -86,38 +58,6 @@ pub struct DepositReleasePartial {
     pub tenant_amount: i128,
     pub landlord_amount: i128,
 }
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UtilityBill {
-    pub lease_id: u64,
-    pub bill_hash: BytesN<32>,
-    pub usdc_amount: i128,
-    pub created_at: u64,
-    pub due_date: u64,
-    pub status: UtilityBillStatus,
-    pub paid_at: Option<u64>,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SubletAgreement {
-    pub lease_id: u64,
-    pub original_tenant: Address,
-    pub sub_tenant: Address,
-    pub start_date: u64,
-    pub end_date: u64,
-    pub rent_amount: i128,
-    pub landlord_percentage_bps: u32, // Basis points (e.g., 8000 = 80%)
-    pub tenant_percentage_bps: u32,    // Basis points (e.g., 2000 = 20%)
-    pub status: SubletStatus,
-    pub created_at: u64,
-    pub total_collected: i128,
-    pub landlord_share: i128,
-    pub tenant_share: i128,
-}
-
-// ── Structs ───────────────────────────────────────────────────────────────────
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -157,7 +97,6 @@ pub struct LeaseInstance {
     pub start_date: u64,
     pub end_date: u64,
     pub property_uri: String,
-    pub property_hash: BytesN<32>,
     pub status: LeaseStatus,
     pub nft_contract: Option<Address>,
     pub token_id: Option<u128>,
@@ -181,54 +120,7 @@ pub struct LeaseInstance {
     pub maintenance_status: MaintenanceStatus,
     pub withheld_rent: i128,
     pub repair_proof_hash: Option<BytesN<32>>,
-    /// Emergency pause state for natural disasters or force majeure events
-    pub paused: bool,
-    /// Reason for the emergency pause
-    pub pause_reason: Option<String>,
-    /// Timestamp when the lease was paused
-    pub paused_at: Option<u64>,
-    /// Address that initiated the pause (admin, landlord, or trusted third party)
-    pub pause_initiator: Option<Address>,
-    /// Total time spent in paused state (to adjust rent calculations)
-    pub total_paused_duration: u64,
-    /// Monthly rent pull authorization - amount approved for automatic withdrawal
-    pub rent_pull_authorized_amount: Option<i128>,
-    /// Timestamp of the last rent pull execution
-    pub last_rent_pull_timestamp: Option<u64>,
-    /// Billing cycle duration in seconds (default: 30 days = 2,592,000 seconds)
-    pub billing_cycle_duration: u64,
-    
-    // --- New Features Data ---
-    /// [ISSUE 32] Security Deposit Yield Delegation
-    pub yield_delegation_enabled: bool,
-    pub yield_accumulated: i128,
-    /// [ISSUE 33] Rent-to-Own Equity Tracker
-    pub equity_balance: i128,
-    pub equity_percentage_bps: u32,
-    /// [ISSUE 34] Tenant Credit History Tracking
-    pub had_late_payment: bool,
-    /// [ISSUE 35] Pet Deposit and Monthly Pet Rent
-    pub has_pet: bool,
-    pub pet_deposit_amount: i128,
-    pub pet_rent_amount: i128,
-    /// [ISSUE 36] Utility Pass-Through Billing
-    pub next_utility_bill_id: u64,
-    pub total_utility_billed: i128,
-    pub total_utility_paid: i128,
-    /// [ISSUE 37] Subletting Authorization and Fee Split
-    pub sublet_enabled: bool,
-    pub sub_tenant: Option<Address>,
-    pub sublet_start_date: Option<u64>,
-    pub sublet_end_date: Option<u64>,
-    pub sublet_landlord_percentage_bps: u32,
-    pub sublet_tenant_percentage_bps: u32,
-    /// [ISSUE 38] Multi-Sig Maintenance Fund Treasury
-    pub maintenance_fund: Option<MaintenanceFund>,
-    pub maintenance_fund_balance: i128,
-    /// [ISSUE 39] Rent Increase Cap Enforcement
-    pub max_annual_increase_bps: u32, // Default 1000 = 10%
-    pub previous_rent_amount: i128,
-    pub last_renewal_date: u64,
+    pub inspector: Option<Address>,
 }
 
 #[contracttype]
@@ -268,17 +160,6 @@ pub struct CreateLeaseParams {
     pub end_date: u64,
     pub property_uri: String,
     pub payment_token: Address,
-    pub rent_per_sec: i128,
-    pub grace_period_end: u64,
-    pub late_fee_flat: i128,
-    pub late_fee_per_sec: i128,
-    pub arbitrators: soroban_sdk::Vec<Address>,
-    // New Feature Params
-    pub equity_percentage_bps: u32,
-    pub has_pet: bool,
-    pub pet_deposit_amount: i128,
-    pub pet_rent_amount: i128,
-    pub yield_delegation_enabled: bool,
 }
 
 #[contracttype]
@@ -294,14 +175,6 @@ pub enum DataKey {
     AllowedAsset(Address),
     AuthorizedPayer(u64, Address),
     RoommateBalance(u64, Address),
-    UtilityBill(u64, u64), // lease_id, bill_id
-    SubletAgreement(u64),  // lease_id
-    // [ISSUE 38] Multi-Sig Maintenance Fund
-    MaintenanceFund(u64), // lease_id
-    // [ISSUE 5] Terminate Bounty
-    PlatformFeeAmount,
-    PlatformFeeToken,
-    PlatformFeeRecipient,
 }
 
 #[contracttype]
@@ -311,8 +184,6 @@ pub struct HistoricalLease {
     pub terminated_by: Address,
     pub terminated_at: u64,
 }
-
-// ── Events ────────────────────────────────────────────────────────────────────
 
 #[contractevent]
 pub struct RoommateAdded {
@@ -398,158 +269,6 @@ pub struct EvictionEligible {
     pub debt: i128,
 }
 
-#[contractevent]
-pub struct EmergencyRentPaused {
-    pub lease_id: u64,
-    pub initiator: Address,
-    pub reason: String,
-    pub paused_at: u64,
-}
-
-#[contractevent]
-pub struct EmergencyRentResumed {
-    pub lease_id: u64,
-    pub initiator: Address,
-    pub resumed_at: u64,
-    pub total_paused_duration: u64,
-}
-
-#[contractevent]
-pub struct RentPullAuthorized {
-    pub lease_id: u64,
-    pub tenant: Address,
-    pub authorized_amount: i128,
-    pub billing_cycle_duration: u64,
-}
-
-#[contractevent]
-pub struct RentPullExecuted {
-    pub lease_id: u64,
-    pub landlord: Address,
-    pub amount_pulled: i128,
-    pub timestamp: u64,
-}
-
-#[contractevent]
-pub struct RentPullRevoked {
-    pub lease_id: u64,
-    pub tenant: Address,
-    pub timestamp: u64,
-}
-
-#[contractevent]
-pub struct YieldDistributed {
-    pub lease_id: u64,
-    pub tenant_yield: i128,
-    pub landlord_yield: i128,
-}
-
-#[contractevent]
-pub struct EquityAccrued {
-    pub lease_id: u64,
-    pub amount: i128,
-    pub total_equity: i128,
-}
-
-#[contractevent]
-pub struct PetStatusChanged {
-    pub lease_id: u64,
-    pub has_pet: bool,
-}
-
-#[contractevent]
-pub struct ResidencyNftMinted {
-    pub lease_id: u64,
-    pub tenant: Address,
-}
-
-#[contractevent]
-pub struct UtilityBillRequested {
-    pub lease_id: u64,
-    pub bill_id: u64,
-    pub bill_hash: BytesN<32>,
-    pub usdc_amount: i128,
-    pub due_date: u64,
-}
-
-#[contractevent]
-pub struct UtilityBillPaid {
-    pub lease_id: u64,
-    pub bill_id: u64,
-    pub tenant: Address,
-    pub amount: i128,
-    pub paid_at: u64,
-}
-
-#[contractevent]
-pub struct SubletAuthorized {
-    pub lease_id: u64,
-    pub original_tenant: Address,
-    pub sub_tenant: Address,
-    pub start_date: u64,
-    pub end_date: u64,
-    pub rent_amount: i128,
-    pub landlord_percentage_bps: u32,
-    pub tenant_percentage_bps: u32,
-}
-
-#[contractevent]
-pub struct SubletRentPaid {
-    pub lease_id: u64,
-    pub sub_tenant: Address,
-    pub amount: i128,
-    pub landlord_share: i128,
-    pub tenant_share: i128,
-}
-
-#[contractevent]
-pub struct SubletTerminated {
-    pub lease_id: u64,
-    pub terminated_by: Address,
-    pub terminated_at: u64,
-}
-
-#[contractevent]
-pub struct MaintenanceFundCreated {
-    pub lease_id: u64,
-    pub fund_address: Address,
-    pub maintenance_percentage_bps: u32,
-}
-
-#[contractevent]
-pub struct MaintenanceContribution {
-    pub lease_id: u64,
-    pub amount: i128,
-    pub total_fund_balance: i128,
-}
-
-#[contractevent]
-pub struct MaintenanceWithdrawn {
-    pub lease_id: u64,
-    pub amount: i128,
-    pub withdrawn_by: Address,
-}
-
-#[contractevent]
-pub struct RentIncreaseCapEnforced {
-    pub lease_id: u64,
-    pub old_rent: i128,
-    pub new_rent: i128,
-    pub increase_percentage_bps: u32,
-    pub max_allowed_bps: u32,
-}
-
-#[contractevent]
-pub struct RentIncreaseRejected {
-    pub lease_id: u64,
-    pub requested_rent: i128,
-    pub previous_rent: i128,
-    pub increase_percentage_bps: u32,
-    pub max_allowed_bps: u32,
-}
-
-// ── Errors ────────────────────────────────────────────────────────────────────
-
 #[contracterror]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseError {
@@ -564,44 +283,11 @@ pub enum LeaseError {
     UsageRightsExpired = 9,
     KycRequired = 10,
     InvalidAsset = 11,
-    WithdrawalAddressNotSet = 12,
-    NotAnArbitrator = 13,
-    LeaseAlreadyPaused = 14,
-    LeaseNotPaused = 15,
-    InvalidPauseReason = 16,
-    RentPullNotAuthorized = 17,
-    BillingCycleNotElapsed = 18,
-    InsufficientAuthorizedAmount = 19,
-    PaymentTokenMismatch = 20,
-    WithdrawalAddressMismatch = 21,
-    YieldDelegationNotEnabled = 22,
-    PetAlreadyExists = 23,
-    PetNotFound = 24,
-    IneligibleForResidencyNft = 25,
-    InvalidPercentage = 26,
-    UtilityBillNotFound = 27,
-    UtilityBillAlreadyPaid = 28,
-    UtilityBillExpired = 29,
-    InvalidAmount = 30,
-    SubletAlreadyEnabled = 31,
-    SubletNotEnabled = 32,
-    SubletAgreementNotFound = 33,
-    InvalidSubletDates = 34,
-    InvalidPercentageSplit = 35,
-    SubletTenantUnauthorized = 36,
-    LeaseAlreadyExists = 37,
-    // [ISSUE 38] Multi-Sig Maintenance Fund Errors
-    MaintenanceFundAlreadyExists = 38,
-    MaintenanceFundNotFound = 39,
-    InsufficientMaintenanceBalance = 40,
-    UnauthorizedMaintenanceWithdrawal = 41,
-    InvalidMaintenancePercentage = 42,
-    // [ISSUE 39] Rent Increase Cap Errors
-    RentIncreaseExceedsCap = 43,
-    InvalidRenewalDate = 44,
+    NftNotReturned = 12,
+    WithdrawalAddressNotSet = 13,
+    NotAnArbitrator = 14,
+    LeaseAlreadyExists = 15,
 }
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
 
 macro_rules! require {
     ($condition:expr, $error_msg:expr) => {
@@ -692,50 +378,6 @@ pub fn archive_lease(env: &Env, lease_id: u64, lease: LeaseInstance, caller: Add
     delete_lease_instance(env, lease_id);
 }
 
-pub fn save_utility_bill(env: &Env, lease_id: u64, bill_id: u64, bill: &UtilityBill) {
-    let key = DataKey::UtilityBill(lease_id, bill_id);
-    env.storage().persistent().set(&key, bill);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
-}
-
-pub fn load_utility_bill(env: &Env, lease_id: u64, bill_id: u64) -> Option<UtilityBill> {
-    env.storage()
-        .persistent()
-        .get(&DataKey::UtilityBill(lease_id, bill_id))
-}
-
-pub fn save_sublet_agreement(env: &Env, lease_id: u64, agreement: &SubletAgreement) {
-    let key = DataKey::SubletAgreement(lease_id);
-    env.storage().persistent().set(&key, agreement);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
-}
-
-pub fn load_sublet_agreement(env: &Env, lease_id: u64) -> Option<SubletAgreement> {
-    env.storage()
-        .persistent()
-        .get(&DataKey::SubletAgreement(lease_id))
-}
-
-// [ISSUE 38] Multi-Sig Maintenance Fund Helper Functions
-
-pub fn save_maintenance_fund(env: &Env, lease_id: u64, fund: &MaintenanceFund) {
-    let key = DataKey::MaintenanceFund(lease_id);
-    env.storage().persistent().set(&key, fund);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
-}
-
-pub fn load_maintenance_fund(env: &Env, lease_id: u64) -> Option<MaintenanceFund> {
-    env.storage()
-        .persistent()
-        .get(&DataKey::MaintenanceFund(lease_id))
-}
-
 mod nft_contract {
     use soroban_sdk::{contractclient, Address, Env};
     #[contractclient(name = "NftClient")]
@@ -759,8 +401,6 @@ mod kyc_contract {
         fn is_verified(env: Env, address: Address) -> bool;
     }
 }
-
-// ── Contract ──────────────────────────────────────────────────────────────────
 
 #[contract]
 pub struct LeaseContract;
@@ -825,8 +465,6 @@ impl LeaseContract {
             .set(&DataKey::KycProvider, &provider);
         Ok(())
     }
-
-    // --- SIMPLE LEASE (Symbol-based) ---
 
     pub fn initialize_lease(
         env: Env,
@@ -927,11 +565,9 @@ impl LeaseContract {
         token_id: u128,
         payment_token: Address,
     ) -> Result<Symbol, LeaseError> {
-        // --- ISSUE #29: DOUBLE SIGN PREVENTION ---
         if env.storage().instance().has(&lease_id) {
             return Err(LeaseError::LeaseAlreadyExists);
         }
-        // -----------------------------------------
 
         landlord.require_auth();
         Self::require_kyc(&env, &landlord, &tenant)?;
@@ -1146,8 +782,6 @@ impl LeaseContract {
         None
     }
 
-    // --- LEASE INSTANCE (u64-based) ---
-
     pub fn create_lease_instance(
         env: Env,
         lease_id: u64,
@@ -1195,36 +829,14 @@ impl LeaseContract {
             maintenance_status: MaintenanceStatus::None,
             withheld_rent: 0,
             repair_proof_hash: None,
-            billing_cycle_duration: 2_592_000, // 30 days in seconds
-            // New Features Initialization
-            yield_delegation_enabled: params.yield_delegation_enabled,
-            yield_accumulated: 0,
-            equity_balance: 0,
-            equity_percentage_bps: params.equity_percentage_bps,
-            had_late_payment: false,
-            has_pet: params.has_pet,
-            pet_deposit_amount: params.pet_deposit_amount,
-            pet_rent_amount: params.pet_rent_amount,
-            // Utility Billing Initialization
-            next_utility_bill_id: 1,
-            total_utility_billed: 0,
-            total_utility_paid: 0,
-            // Subletting Initialization
-            sublet_enabled: false,
-            sub_tenant: None,
-            sublet_start_date: None,
-            sublet_end_date: None,
-            sublet_landlord_percentage_bps: 8000, // Default 80% to landlord
-            sublet_tenant_percentage_bps: 2000,   // Default 20% to original tenant
-            // [ISSUE 38] Multi-Sig Maintenance Fund Initialization
-            maintenance_fund: None,
-            maintenance_fund_balance: 0,
-            // [ISSUE 39] Rent Increase Cap Initialization
-            max_annual_increase_bps: 1000, // Default 10% annual increase cap
-            previous_rent_amount: params.rent_amount,
-            last_renewal_date: params.start_date,
+            inspector: None,
         };
         save_lease_instance(&env, lease_id, &lease);
+        LeaseSigned {
+            lease_id,
+            property_hash: params.property_uri.clone(),
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -1279,59 +891,15 @@ impl LeaseContract {
             .persistent()
             .extend_ttl(&balance_key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
 
-        // Update Cumulative Payments
         lease.cumulative_payments += payment_amount;
+        lease.rent_paid += payment_amount;
 
-        // [ISSUE 33] Calculate Equity Portion
-        let equity_amount = (payment_amount * (lease.equity_percentage_bps as i128)) / 10000;
-        lease.equity_balance += equity_amount;
-        
-        // [ISSUE 34] Late Payment Tracking
-        // Check if the tenant is currently in debt before this payment
-        if lease.debt > 0 {
-            lease.had_late_payment = true;
+        RentPaidPartial {
+            lease_id,
+            roommate: payer.clone(),
+            amount: payment_amount,
         }
-
-        // Rent portion available for landlord withdrawal (excludes equity)
-        let rent_to_lanlord = payment_amount - equity_amount;
-        lease.rent_paid += rent_to_lanlord;
-
-        // [ISSUE 38] Multi-Sig Maintenance Fund Contribution
-        let maintenance_contribution = if lease.maintenance_fund.is_some() {
-            let fund = lease.maintenance_fund.as_ref().unwrap();
-            (payment_amount * (fund.maintenance_percentage_bps as i128)) / 10000
-        } else {
-            0
-        };
-
-        if maintenance_contribution > 0 {
-            lease.maintenance_fund_balance += maintenance_contribution;
-            
-            // Update the maintenance fund record
-            if let Some(mut fund) = lease.maintenance_fund.clone() {
-                fund.total_collected += maintenance_contribution;
-                lease.maintenance_fund = Some(fund);
-                save_maintenance_fund(&env, lease_id, &lease.maintenance_fund.as_ref().unwrap());
-            }
-
-            MaintenanceContribution {
-                lease_id,
-                amount: maintenance_contribution,
-                total_fund_balance: lease.maintenance_fund_balance,
-            }.publish(&env);
-        }
-
-        // token_client.transfer(&payer, &env.current_contract_address(), &payment_amount);
-
-        if equity_amount > 0 {
-            EquityAccrued {
-                lease_id,
-                amount: equity_amount,
-                total_equity: lease.equity_balance,
-            }.publish(&env);
-        }
-
-        RentPaidPartial { lease_id, roommate: payer.clone(), amount: payment_amount }.publish(&env);
+        .publish(&env);
 
         if let Some(buyout_price) = lease.buyout_price {
             if lease.cumulative_payments >= buyout_price {
@@ -1387,8 +955,6 @@ impl LeaseContract {
             .clone()
             .ok_or(LeaseError::WithdrawalAddressNotSet)?;
         let _withdrawable_amount = lease.rent_paid - lease.rent_withdrawn;
-
-        // token_client.transfer(&env.current_contract_address(), &_withdrawal_address, &_withdrawable_amount);
 
         lease.rent_withdrawn += _withdrawable_amount;
         save_lease_instance(&env, lease_id, &lease);
@@ -1461,27 +1027,22 @@ impl LeaseContract {
         .publish(&env);
         Ok(())
     }
-    pub fn conclude_lease(env: Env, lease_id: u64, landlord: Address, damage_deduction: i128) -> Result<i128, LeaseError> {
-        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
-        if landlord != lease.landlord { return Err(LeaseError::Unauthorised); }
-        landlord.require_auth();
-        Self::require_kyc(&env, &lease.landlord, &lease.tenant)?;
 
-        if env.ledger().timestamp() < lease.end_date { return Err(LeaseError::LeaseNotExpired); }
+    pub fn conclude_lease(
+        env: Env,
+        lease_id: u64,
+        landlord: Address,
+        damage_deduction: i128,
+    ) -> Result<i128, LeaseError> {
+        let mut lease =
+            load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        if landlord != lease.landlord {
+            return Err(LeaseError::Unauthorised);
+        }
+        landlord.require_auth();
 
         if damage_deduction < 0 || damage_deduction > lease.deposit_amount {
             return Err(LeaseError::InvalidDeduction);
-        }
-
-        // [ISSUE 34] Create Tenant Credit History NFT Minter
-        // Criteria: 12-month lease completion, no late payments
-        let duration = lease.end_date.saturating_sub(lease.start_date);
-        let year_in_seconds = 31_536_000;
-        if duration >= year_in_seconds && !lease.had_late_payment {
-            ResidencyNftMinted {
-                lease_id,
-                tenant: lease.tenant.clone(),
-            }.publish(&env);
         }
 
         lease.status = LeaseStatus::Terminated;
@@ -1598,33 +1159,7 @@ impl LeaseContract {
             id: lease_id,
             reason: String::from_str(&env, "Payment stream ran dry"),
         }
-        landlord.require_auth();
-        
-        // 3. Validate damage deduction
-        if damage_deduction < 0 || damage_deduction > lease.security_deposit {
-            return Err(LeaseError::InvalidDeduction);
-        }
-
-        let refund_amount = lease.security_deposit - damage_deduction;
-
-        // [ISSUE 34] Create Tenant Credit History NFT Minter
-        // Criteria: 12-month lease completion, no late payments
-        let duration = lease.end_date.saturating_sub(lease.start_date);
-        let year_in_seconds = 31_536_000;
-        if duration >= year_in_seconds && !lease.had_late_payment {
-            ResidencyNftMinted {
-                lease_id,
-                tenant: lease.tenant.clone(),
-            }.publish(&env);
-            // In a real implementation, we would call an NFT contract here to mint.
-            // For now, publishing the event serves as the "Digital Resume" trigger.
-        }
-
-        // 4. Update lease state
-        lease.status = LeaseStatus::Terminated;
-        lease.deposit_status = DepositStatus::Settled;
-        lease.active = false;
-        save_lease_instance(&env, lease_id, &lease);
+        .publish(&env);
 
         Ok(())
     }
@@ -1744,37 +1279,14 @@ impl LeaseContract {
         let mut lease =
             load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
         let current_time = env.ledger().timestamp();
-        
-        // Calculate effective elapsed time (excluding paused periods)
-        let mut effective_elapsed_secs = current_time.saturating_sub(lease.start_date);
-        
-        // Subtract total paused duration from elapsed time
-        effective_elapsed_secs = effective_elapsed_secs.saturating_sub(lease.total_paused_duration);
-        
-        // If currently paused, subtract current pause duration
-        if lease.paused {
-            if let Some(paused_at) = lease.paused_at {
-                let current_pause_duration = current_time.saturating_sub(paused_at);
-                effective_elapsed_secs = effective_elapsed_secs.saturating_sub(current_pause_duration);
-            }
-        }
 
-        // [ISSUE 35] Include Pet Rent in expected calculations
-        // We calculate pet rent based on elapsed billing cycles
-        let billing_cycles = effective_elapsed_secs / lease.billing_cycle_duration;
-        let accrued_pet_rent = (billing_cycles as i128) * lease.pet_rent_amount;
-        
-        let expected_rent = (effective_elapsed_secs as i128).saturating_mul(lease.rent_per_sec) + accrued_pet_rent;
+        let elapsed_secs = current_time.saturating_sub(lease.start_date);
+        let expected_rent = (elapsed_secs as i128).saturating_mul(lease.rent_per_sec);
         let unpaid_rent = expected_rent.saturating_sub(lease.rent_paid);
         let mut total_debt = if unpaid_rent > 0 { unpaid_rent } else { 0 };
 
         if current_time > lease.grace_period_end {
             let seconds_late = current_time - lease.grace_period_end;
-
-            if seconds_late > 0 {
-                // [ISSUE 34] Mark as had late payment
-                lease.had_late_payment = true;
-            }
 
             if !lease.flat_fee_applied {
                 lease.debt += lease.late_fee_flat;
@@ -1786,6 +1298,14 @@ impl LeaseContract {
                 lease.debt += (newly_accrued as i128) * lease.late_fee_per_sec;
                 lease.seconds_late_charged = seconds_late;
             }
+
+            let days_late = seconds_late / 86_400;
+            PaymentLate {
+                lease_id,
+                days_late,
+                current_fine: lease.debt,
+            }
+            .publish(&env);
         }
 
         total_debt += lease.debt;
@@ -1805,81 +1325,12 @@ impl LeaseContract {
         Ok(total_debt)
     }
 
-    // --- [ISSUE 32] Security Deposit Yield Delegation ---
-
-    pub fn enable_yield_delegation(env: Env, lease_id: u64, tenant: Address) -> Result<(), LeaseError> {
-        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
-        if lease.tenant != tenant { return Err(LeaseError::Unauthorised); }
-        tenant.require_auth();
-
-        lease.yield_delegation_enabled = true;
-        save_lease_instance(&env, lease_id, &lease);
-        Ok(())
-    }
-
-    /// Hook for a "Safe" liquidity pool to distribute earned yield.
-    /// Split interest between landlord and tenant.
-    pub fn distribute_yield(env: Env, lease_id: u64, yield_amount: i128) -> Result<(), LeaseError> {
-        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
-        if !lease.yield_delegation_enabled { return Err(LeaseError::YieldDelegationNotEnabled); }
-
-        // Split yield 50/50 between landlord and tenant
-        let half_yield = yield_amount / 2;
-        
-        // Tenant's portion increases their security deposit (productive asset)
-        // Landlord's portion is added to their withdrawable rent balance
-        lease.security_deposit += half_yield;
-        lease.rent_paid += half_yield;
-        lease.yield_accumulated += yield_amount;
-
-        save_lease_instance(&env, lease_id, &lease);
-
-        YieldDistributed {
-            lease_id,
-            tenant_yield: half_yield,
-            landlord_yield: half_yield,
-        }.publish(&env);
-
-        Ok(())
-    }
-
-    // --- [ISSUE 35] Pet Management ---
-
-    pub fn toggle_pet(env: Env, lease_id: u64, landlord: Address, has_pet: bool, pet_deposit: i128, pet_rent: i128) -> Result<(), LeaseError> {
-        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
-        if lease.landlord != landlord { return Err(LeaseError::Unauthorised); }
-        landlord.require_auth();
-
-        lease.has_pet = has_pet;
-        lease.pet_deposit_amount = pet_deposit;
-        lease.pet_rent_amount = pet_rent;
-        
-        // If pet is added, we might need a pet deposit payment from tenant.
-        // For simplicity, we assume the deposit is handled via a separate payment or upfront.
-
-        save_lease_instance(&env, lease_id, &lease);
-        
-        PetStatusChanged { lease_id, has_pet }.publish(&env);
-        Ok(())
-    }
-
-    /// Handles partial refund of the pet deposit while keeping main security deposit intact.
-    pub fn refund_pet_deposit(env: Env, lease_id: u64, landlord: Address, amount: i128) -> Result<i128, LeaseError> {
-        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
-        if lease.landlord != landlord { return Err(LeaseError::Unauthorised); }
-        landlord.require_auth();
-
-        if amount > lease.pet_deposit_amount { return Err(LeaseError::InvalidDeduction); }
-
-        let refund_amount = amount;
-        lease.pet_deposit_amount -= amount;
-
-        save_lease_instance(&env, lease_id, &lease);
-        Ok(refund_amount)
-    }
-
-    /// Authorizes an additional roommate to make payments towards a lease.
-    pub fn add_authorized_payer(env: Env, lease_id: u64, landlord: Address, roommate: Address) -> Result<(), LeaseError> {
+    pub fn add_authorized_payer(
+        env: Env,
+        lease_id: u64,
+        landlord: Address,
+        roommate: Address,
+    ) -> Result<(), LeaseError> {
         let lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
 
         if lease.landlord != landlord {
@@ -1902,624 +1353,6 @@ impl LeaseContract {
             .persistent()
             .get(&DataKey::RoommateBalance(lease_id, roommate))
             .unwrap_or(0)
-    }
-
-    // --- [ISSUE 36] Utility Pass-Through Billing ---
-
-    /// Landlord requests utility payment from tenant by uploading bill hash and USDC amount
-    /// Tenant has 7 days to pay the utility bill through the contract
-    pub fn request_utility_payment(
-        env: Env,
-        lease_id: u64,
-        landlord: Address,
-        bill_hash: BytesN<32>,
-        usdc_amount: i128,
-    ) -> Result<u64, LeaseError> {
-        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
-        
-        if lease.landlord != landlord {
-            return Err(LeaseError::Unauthorised);
-        }
-        
-        if usdc_amount <= 0 {
-            return Err(LeaseError::InvalidAmount);
-        }
-        
-        landlord.require_auth();
-        
-        let now = env.ledger().timestamp();
-        let due_date = now + (7 * 24 * 60 * 60); // 7 days from now
-        
-        let bill_id = lease.next_utility_bill_id;
-        let utility_bill = UtilityBill {
-            lease_id,
-            bill_hash: bill_hash.clone(),
-            usdc_amount,
-            created_at: now,
-            due_date,
-            status: UtilityBillStatus::Pending,
-            paid_at: None,
-        };
-        
-        // Save the utility bill
-        save_utility_bill(&env, lease_id, bill_id, &utility_bill);
-        
-        // Update lease state
-        lease.next_utility_bill_id += 1;
-        lease.total_utility_billed += usdc_amount;
-        save_lease_instance(&env, lease_id, &lease);
-        
-        // Publish event
-        UtilityBillRequested {
-            lease_id,
-            bill_id,
-            bill_hash,
-            usdc_amount,
-            due_date,
-        }.publish(&env);
-        
-        Ok(bill_id)
-    }
-    
-    /// Tenant pays a utility bill
-    pub fn pay_utility_bill(
-        env: Env,
-        lease_id: u64,
-        bill_id: u64,
-        tenant: Address,
-        payment_amount: i128,
-    ) -> Result<(), LeaseError> {
-        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
-        
-        if lease.tenant != tenant {
-            return Err(LeaseError::Unauthorised);
-        }
-        
-        let mut utility_bill = load_utility_bill(&env, lease_id, bill_id)
-            .ok_or(LeaseError::UtilityBillNotFound)?;
-            
-        if utility_bill.status != UtilityBillStatus::Pending {
-            return Err(LeaseError::UtilityBillAlreadyPaid);
-        }
-        
-        let now = env.ledger().timestamp();
-        
-        // Check if bill has expired (7 days past due date)
-        if now > utility_bill.due_date {
-            utility_bill.status = UtilityBillStatus::Expired;
-            save_utility_bill(&env, lease_id, bill_id, &utility_bill);
-            return Err(LeaseError::UtilityBillExpired);
-        }
-        
-        if payment_amount != utility_bill.usdc_amount {
-            return Err(LeaseError::InvalidAmount);
-        }
-        
-        tenant.require_auth();
-        
-        // Update utility bill status
-        utility_bill.status = UtilityBillStatus::Paid;
-        utility_bill.paid_at = Some(now);
-        save_utility_bill(&env, lease_id, bill_id, &utility_bill);
-        
-        // Update lease totals
-        lease.total_utility_paid += payment_amount;
-        save_lease_instance(&env, lease_id, &lease);
-        
-        // Publish event
-        UtilityBillPaid {
-            lease_id,
-            bill_id,
-            tenant,
-            amount: payment_amount,
-            paid_at: now,
-        }.publish(&env);
-        
-        Ok(())
-    }
-    
-    /// Get details of a specific utility bill
-    pub fn get_utility_bill(env: Env, lease_id: u64, bill_id: u64) -> Result<UtilityBill, LeaseError> {
-        load_utility_bill(&env, lease_id, bill_id).ok_or(LeaseError::UtilityBillNotFound)
-    }
-    
-    /// Get all utility bills for a lease (returns count, actual bills would need pagination)
-    pub fn get_utility_bill_count(env: Env, lease_id: u64) -> Result<u64, LeaseError> {
-        let lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
-        Ok(lease.next_utility_bill_id - 1)
-    }
-
-    // --- [ISSUE 37] Subletting Authorization and Fee Split ---
-
-    /// Original tenant authorizes a sub-tenant with specified rent and percentage split
-    pub fn authorize_sublet(
-        env: Env,
-        lease_id: u64,
-        original_tenant: Address,
-        sub_tenant: Address,
-        start_date: u64,
-        end_date: u64,
-        rent_amount: i128,
-        landlord_percentage_bps: u32,
-        tenant_percentage_bps: u32,
-    ) -> Result<(), LeaseError> {
-        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
-        
-        if lease.tenant != original_tenant {
-            return Err(LeaseError::Unauthorised);
-        }
-        
-        if lease.sublet_enabled {
-            return Err(LeaseError::SubletAlreadyEnabled);
-        }
-        
-        // Validate percentage split (must add up to 10000 = 100%)
-        if landlord_percentage_bps + tenant_percentage_bps != 10000 {
-            return Err(LeaseError::InvalidPercentageSplit);
-        }
-        
-        // Validate dates
-        let now = env.ledger().timestamp();
-        if start_date < now || end_date <= start_date || end_date > lease.end_date {
-            return Err(LeaseError::InvalidSubletDates);
-        }
-        
-        if rent_amount <= 0 {
-            return Err(LeaseError::InvalidAmount);
-        }
-        
-        original_tenant.require_auth();
-        
-        // Create sublet agreement
-        let sublet_agreement = SubletAgreement {
-            lease_id,
-            original_tenant: original_tenant.clone(),
-            sub_tenant: sub_tenant.clone(),
-            start_date,
-            end_date,
-            rent_amount,
-            landlord_percentage_bps,
-            tenant_percentage_bps,
-            status: SubletStatus::Active,
-            created_at: now,
-            total_collected: 0,
-            landlord_share: 0,
-            tenant_share: 0,
-        };
-        
-        // Update lease state
-        lease.sublet_enabled = true;
-        lease.sub_tenant = Some(sub_tenant.clone());
-        lease.sublet_start_date = Some(start_date);
-        lease.sublet_end_date = Some(end_date);
-        lease.sublet_landlord_percentage_bps = landlord_percentage_bps;
-        lease.sublet_tenant_percentage_bps = tenant_percentage_bps;
-        
-        // Save changes
-        save_sublet_agreement(&env, lease_id, &sublet_agreement);
-        save_lease_instance(&env, lease_id, &lease);
-        
-        // Publish event
-        SubletAuthorized {
-            lease_id,
-            original_tenant,
-            sub_tenant,
-            start_date,
-            end_date,
-            rent_amount,
-            landlord_percentage_bps,
-            tenant_percentage_bps,
-        }.publish(&env);
-        
-        Ok(())
-    }
-    
-    /// Sub-tenant pays rent, which gets split between landlord and original tenant
-    pub fn pay_sublet_rent(
-        env: Env,
-        lease_id: u64,
-        sub_tenant: Address,
-        payment_amount: i128,
-    ) -> Result<(), LeaseError> {
-        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
-        
-        if !lease.sublet_enabled {
-            return Err(LeaseError::SubletNotEnabled);
-        }
-        
-        if lease.sub_tenant.as_ref() != Some(&sub_tenant) {
-            return Err(LeaseError::SubletTenantUnauthorized);
-        }
-        
-        let mut sublet_agreement = load_sublet_agreement(&env, lease_id)
-            .ok_or(LeaseError::SubletAgreementNotFound)?;
-            
-        if sublet_agreement.status != SubletStatus::Active {
-            return Err(LeaseError::SubletNotEnabled);
-        }
-        
-        let now = env.ledger().timestamp();
-        
-        // Check if sublet is still valid
-        if now < sublet_agreement.start_date || now > sublet_agreement.end_date {
-            return Err(LeaseError::InvalidSubletDates);
-        }
-        
-        if payment_amount != sublet_agreement.rent_amount {
-            return Err(LeaseError::InvalidAmount);
-        }
-        
-        sub_tenant.require_auth();
-        
-        // Calculate splits
-        let landlord_share = (payment_amount * (sublet_agreement.landlord_percentage_bps as i128)) / 10000;
-        let tenant_share = payment_amount - landlord_share;
-        
-        // Update sublet agreement
-        sublet_agreement.total_collected += payment_amount;
-        sublet_agreement.landlord_share += landlord_share;
-        sublet_agreement.tenant_share += tenant_share;
-        save_sublet_agreement(&env, lease_id, &sublet_agreement);
-        
-        // Update lease rent tracking (landlord portion counts as rent paid)
-        lease.rent_paid += landlord_share;
-        lease.cumulative_payments += payment_amount;
-        save_lease_instance(&env, lease_id, &lease);
-        
-        // Publish event
-        SubletRentPaid {
-            lease_id,
-            sub_tenant,
-            amount: payment_amount,
-            landlord_share,
-            tenant_share,
-        }.publish(&env);
-        
-        Ok(())
-    }
-    
-    /// Terminate sublet agreement (can be called by original tenant or landlord)
-    pub fn terminate_sublet(
-        env: Env,
-        lease_id: u64,
-        caller: Address,
-    ) -> Result<(), LeaseError> {
-        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
-        
-        if !lease.sublet_enabled {
-            return Err(LeaseError::SubletNotEnabled);
-        }
-        
-        let is_original_tenant = caller == lease.tenant;
-        let is_landlord = caller == lease.landlord;
-        
-        if !is_original_tenant && !is_landlord {
-            return Err(LeaseError::Unauthorised);
-        }
-        
-        caller.require_auth();
-        
-        let mut sublet_agreement = load_sublet_agreement(&env, lease_id)
-            .ok_or(LeaseError::SubletAgreementNotFound)?;
-            
-        sublet_agreement.status = SubletStatus::Terminated;
-        save_sublet_agreement(&env, lease_id, &sublet_agreement);
-        
-        // Reset lease subletting state
-        lease.sublet_enabled = false;
-        lease.sub_tenant = None;
-        lease.sublet_start_date = None;
-        lease.sublet_end_date = None;
-        save_lease_instance(&env, lease_id, &lease);
-        
-        // Publish event
-        SubletTerminated {
-            lease_id,
-            terminated_by: caller,
-            terminated_at: env.ledger().timestamp(),
-        }.publish(&env);
-        
-        Ok(())
-    }
-    
-    /// Get sublet agreement details
-    pub fn get_sublet_agreement(env: Env, lease_id: u64) -> Result<SubletAgreement, LeaseError> {
-        load_sublet_agreement(&env, lease_id).ok_or(LeaseError::SubletAgreementNotFound)
-    }
-
-    // --- [ISSUE 38] Multi-Sig Maintenance Fund Treasury ---
-
-    /// Create a multi-sig maintenance fund for a lease
-    pub fn create_maintenance_fund(
-        env: Env,
-        lease_id: u64,
-        landlord: Address,
-        fund_address: Address,
-        signatories: soroban_sdk::Vec<Address>,
-        threshold: u32,
-        maintenance_percentage_bps: u32,
-    ) -> Result<(), LeaseError> {
-        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
-        
-        if lease.landlord != landlord {
-            return Err(LeaseError::Unauthorised);
-        }
-        
-        if lease.maintenance_fund.is_some() {
-            return Err(LeaseError::MaintenanceFundAlreadyExists);
-        }
-        
-        // Validate maintenance percentage (must be between 0 and 10000 = 100%)
-        if maintenance_percentage_bps > 10000 {
-            return Err(LeaseError::InvalidMaintenancePercentage);
-        }
-        
-        // Validate threshold (must be at least 1 and not exceed number of signatories)
-        if threshold == 0 || threshold > signatories.len() as u32 {
-            return Err(LeaseError::Unauthorised);
-        }
-        
-        landlord.require_auth();
-        
-        let maintenance_fund = MaintenanceFund {
-            fund_address: fund_address.clone(),
-            signatories: signatories.clone(),
-            threshold,
-            total_collected: 0,
-            total_withdrawn: 0,
-            maintenance_percentage_bps,
-        };
-        
-        // Update lease
-        lease.maintenance_fund = Some(maintenance_fund.clone());
-        save_lease_instance(&env, lease_id, &lease);
-        
-        // Save maintenance fund separately for easy access
-        save_maintenance_fund(&env, lease_id, &maintenance_fund);
-        
-        // Publish event
-        MaintenanceFundCreated {
-            lease_id,
-            fund_address,
-            maintenance_percentage_bps,
-        }.publish(&env);
-        
-        Ok(())
-    }
-    
-    /// Withdraw from maintenance fund (requires multi-sig authorization)
-    pub fn withdraw_maintenance_fund(
-        env: Env,
-        lease_id: u64,
-        requester: Address,
-        amount: i128,
-        signatures: soroban_sdk::Vec<Address>,
-    ) -> Result<(), LeaseError> {
-        let lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
-        let mut fund = load_maintenance_fund(&env, lease_id).ok_or(LeaseError::MaintenanceFundNotFound)?;
-        
-        // Validate amount
-        if amount <= 0 || amount > lease.maintenance_fund_balance {
-            return Err(LeaseError::InsufficientMaintenanceBalance);
-        }
-        
-        // Check if requester is authorized signatory
-        if !fund.signatories.contains(&requester) {
-            return Err(LeaseError::UnauthorizedMaintenanceWithdrawal);
-        }
-        
-        // Validate signatures (in a real implementation, this would involve cryptographic signature verification)
-        let mut valid_signatures = 0;
-        for signatory in signatures.iter() {
-            if fund.signatories.contains(&signatory) {
-                valid_signatures += 1;
-            }
-        }
-        
-        if valid_signatures < fund.threshold {
-            return Err(LeaseError::UnauthorizedMaintenanceWithdrawal);
-        }
-        
-        requester.require_auth();
-        
-        // Update fund state
-        fund.total_withdrawn += amount;
-        lease.maintenance_fund_balance -= amount;
-        lease.maintenance_fund = Some(fund.clone());
-        
-        // Save changes
-        save_maintenance_fund(&env, lease_id, &fund);
-        save_lease_instance(&env, lease_id, &lease);
-        
-        // Publish event
-        MaintenanceWithdrawn {
-            lease_id,
-            amount,
-            withdrawn_by: requester,
-        }.publish(&env);
-        
-        Ok(())
-    }
-    
-    /// Get maintenance fund details
-    pub fn get_maintenance_fund(env: Env, lease_id: u64) -> Result<MaintenanceFund, LeaseError> {
-        load_maintenance_fund(&env, lease_id).ok_or(LeaseError::MaintenanceFundNotFound)
-    }
-
-    // --- [ISSUE 39] Rent Increase Cap Enforcement ---
-
-    /// Renew lease with rent increase cap enforcement
-    pub fn renew_lease(
-        env: Env,
-        lease_id: u64,
-        landlord: Address,
-        new_rent_amount: i128,
-        new_end_date: u64,
-    ) -> Result<(), LeaseError> {
-        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
-        
-        if lease.landlord != landlord {
-            return Err(LeaseError::Unauthorised);
-        }
-        
-        let now = env.ledger().timestamp();
-        
-        // Validate renewal date (must be in the future and after current end date)
-        if new_end_date <= now || new_end_date <= lease.end_date {
-            return Err(LeaseError::InvalidRenewalDate);
-        }
-        
-        // Calculate rent increase percentage
-        let rent_difference = new_rent_amount.saturating_sub(lease.previous_rent_amount);
-        let increase_percentage_bps = if lease.previous_rent_amount > 0 {
-            (rent_difference * 10000) / lease.previous_rent_amount
-        } else {
-            0
-        };
-        
-        // Check if increase exceeds cap
-        if increase_percentage_bps > lease.max_annual_increase_bps {
-            RentIncreaseRejected {
-                lease_id,
-                requested_rent: new_rent_amount,
-                previous_rent: lease.previous_rent_amount,
-                increase_percentage_bps,
-                max_allowed_bps: lease.max_annual_increase_bps,
-            }.publish(&env);
-            return Err(LeaseError::RentIncreaseExceedsCap);
-        }
-        
-        landlord.require_auth();
-        
-        // Update lease with new terms
-        lease.previous_rent_amount = lease.rent_amount;
-        lease.rent_amount = new_rent_amount;
-        lease.end_date = new_end_date;
-        lease.last_renewal_date = now;
-        
-        // Recalculate rent per second if needed
-        lease.rent_per_sec = if lease.billing_cycle_duration > 0 {
-            new_rent_amount / (lease.billing_cycle_duration as i128)
-        } else {
-            0
-        };
-        
-        save_lease_instance(&env, lease_id, &lease);
-        
-        // Publish event
-        RentIncreaseCapEnforced {
-            lease_id,
-            old_rent: lease.previous_rent_amount,
-            new_rent: new_rent_amount,
-            increase_percentage_bps,
-            max_allowed_bps: lease.max_annual_increase_bps,
-        }.publish(&env);
-        
-        Ok(())
-    }
-    
-    /// Update maximum annual increase cap (only callable by landlord)
-    pub fn update_rent_increase_cap(
-        env: Env,
-        lease_id: u64,
-        landlord: Address,
-        new_max_annual_increase_bps: u32,
-    ) -> Result<(), LeaseError> {
-        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
-        
-        if lease.landlord != landlord {
-            return Err(LeaseError::Unauthorised);
-        }
-        
-        // Validate new cap (must be between 0 and 10000 = 100%)
-        if new_max_annual_increase_bps > 10000 {
-            return Err(LeaseError::InvalidPercentage);
-        }
-        
-        landlord.require_auth();
-        
-        lease.max_annual_increase_bps = new_max_annual_increase_bps;
-        save_lease_instance(&env, lease_id, &lease);
-        
-        Ok(())
-    }
-    
-    /// Generates a unique property hash based on property URI and landlord
-    fn generate_property_hash(env: &Env, property_uri: &String, landlord: &Address) -> BytesN<32> {
-        // Very simple deterministic hash generation
-        // In production, this should use proper cryptographic hashing
-        let mut result = [0u8; 32];
-        
-        // Use property URI length for variation
-        let uri_len = property_uri.to_bytes().len() as u8;
-        result[0] = uri_len;
-        
-        // Use a simple pattern - this is just for demonstration
-        result[1] = 42;
-        result[2] = 123;
-        
-        // Fill rest with a simple pattern
-        for i in 3..32 {
-            result[i] = result[i-1].wrapping_add(result[i-2]).wrapping_mul(7);
-        }
-        
-        BytesN::from_array(&env, &result)
-    }
-    
-    /// Checks if property is already registered in global registry
-    fn is_property_already_leased(env: &Env, property_hash: &BytesN<32>) -> bool {
-        let key = (symbol_short!("GLOBAL"), property_hash);
-        env.storage()
-            .persistent()
-            .get::<_, Address>(&key)
-            .is_some()
-    }
-    
-    /// Registers property in global registry
-    fn register_property_in_global(env: &Env, property_hash: &BytesN<32>, contract_address: &Address) {
-        let key = (symbol_short!("GLOBAL"), property_hash);
-        env.storage()
-            .persistent()
-            .set(&key, contract_address);
-    }
-    
-    /// Removes property from global registry (for lease termination)
-    pub fn remove_from_global_registry(env: Env, landlord: Address) -> Symbol {
-        let lease = Self::get_lease(env.clone());
-        
-        require!(lease.landlord == landlord, LeaseError::UnauthorizedRegistryRemoval);
-        require!(lease.status == LeaseStatus::Expired, LeaseError::LeaseNotActive);
-        
-        let key = (symbol_short!("GLOBAL"), &lease.property_hash);
-        env.storage()
-            .persistent()
-            .remove(&key);
-        
-        symbol_short!("removed")
-    }
-    
-    /// Checks if tenant is current on rent (for IoT integration)
-    pub fn is_tenant_current_on_rent(env: Env) -> bool {
-        let lease = Self::get_lease(env.clone());
-        
-        match lease.status {
-            LeaseStatus::Active => {
-                let current_time = env.ledger().timestamp();
-                current_time < lease.end_date
-            }
-            _ => false,
-        }
-    }
-    
-    /// Gets lease status for external systems
-    pub fn get_lease_status(env: Env) -> Symbol {
-        let lease = Self::get_lease(env.clone());
-        match lease.status {
-            LeaseStatus::Pending => symbol_short!("pending"),
-            LeaseStatus::Active => symbol_short!("active"),
-            LeaseStatus::Expired => symbol_short!("expired"),
-            LeaseStatus::Disputed => symbol_short!("disputed"),
-        }
     }
 }
 
