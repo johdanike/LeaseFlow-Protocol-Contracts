@@ -7,7 +7,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, Address,
-    BytesN, Env, String, Symbol,
+    BytesN, Env, String, Symbol, Vec,
 };
 
 #[contracttype]
@@ -123,12 +123,22 @@ pub struct LeaseInstance {
     pub withheld_rent: i128,
     pub repair_proof_hash: Option<BytesN<32>>,
     pub inspector: Option<Address>,
-    pub wear_allowance_bps: u32,
-    pub asset_lifespan_days: u64,
-    pub asset_value: i128,
-    pub deposit_timestamp: u64,
-    pub subleasing_allowed: bool,
-    pub master_lease_id: Option<u64>,
+    pub paused: bool,
+    pub pause_reason: Option<String>,
+    pub paused_at: Option<u64>,
+    pub pause_initiator: Option<Address>,
+    pub total_paused_duration: u64,
+    pub rent_pull_authorized_amount: Option<i128>,
+    pub last_rent_pull_timestamp: Option<u64>,
+    pub billing_cycle_duration: u64,
+    pub yield_delegation_enabled: bool,
+    pub yield_accumulated: i128,
+    pub equity_balance: i128,
+    pub equity_percentage_bps: u32,
+    pub had_late_payment: bool,
+    pub has_pet: bool,
+    pub pet_deposit_amount: i128,
+    pub pet_rent_amount: i128,
 }
 
 #[contracttype]
@@ -168,58 +178,20 @@ pub struct CreateLeaseParams {
     pub end_date: u64,
     pub property_uri: String,
     pub payment_token: Address,
-    pub wear_allowance_bps: u32,
-    pub asset_lifespan_days: u64,
-    pub asset_value: i128,
-    pub subleasing_allowed: bool,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DisputeCase {
-    pub lease_id: u64,
-    pub challenger: Address,
-    pub dispute_timestamp: u64,
-    pub dispute_bond: i128,
-    pub selected_jurors: soroban_sdk::Vec<Address>,
-    pub juror_votes: soroban_sdk::Vec<bool>,
-    pub verdict_deadline: u64,
-    pub is_resolved: bool,
-    pub resolution: Option<DepositReleasePartial>,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Juror {
-    pub address: Address,
-    pub reputation: u32,
-    pub stake_amount: i128,
-    pub cases_participated: u32,
-    pub successful_votes: u32,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SubEscrowVault {
-    pub master_lease_id: u64,
-    pub sub_lease_id: u64,
-    pub sub_lessee: Address,
-    pub deposit_amount: i128,
-    pub is_active: bool,
-    pub created_at: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CreateSubleaseParams {
-    pub master_lease_id: u64,
-    pub sub_lessee: Address,
-    pub sub_rent_amount: i128,
-    pub sub_deposit_amount: i128,
-    pub sub_start_date: u64,
-    pub sub_end_date: u64,
-    pub property_uri: String,
-    pub payment_token: Address,
+    pub arbitrators: Vec<Address>,
+    pub rent_per_sec: i128,
+    pub grace_period_end: u64,
+    pub late_fee_flat: i128,
+    pub late_fee_per_sec: i128,
+    pub equity_percentage_bps: u32,
+    pub has_pet: bool,
+    pub pet_deposit_amount: i128,
+    pub pet_rent_amount: i128,
+    pub yield_delegation_enabled: bool,
+    pub deposit_asset: Option<Address>,
+    pub dex_contract: Option<Address>,
+    pub max_slippage_bps: u32,
+    pub swap_path: Vec<Address>,
 }
 
 #[contracttype]
@@ -379,47 +351,13 @@ pub struct EvictionEligible {
 }
 
 #[contractevent]
-pub struct DisputeRaised {
+pub struct CrossAssetDepositLocked {
     pub lease_id: u64,
-    pub challenger: Address,
-    pub dispute_bond: i128,
-    pub selected_jurors: soroban_sdk::Vec<Address>,
-    pub verdict_deadline: u64,
-}
-
-#[contractevent]
-pub struct JurorSelected {
-    pub lease_id: u64,
-    pub juror: Address,
-}
-
-#[contractevent]
-pub struct JurorVerdict {
-    pub lease_id: u64,
-    pub juror: Address,
-    pub vote: bool,
-}
-
-#[contractevent]
-pub struct JurorSlashed {
-    pub juror: Address,
-    pub slash_amount: i128,
-    pub reason: String,
-}
-
-#[contractevent]
-pub struct SubleaseCreated {
-    pub master_lease_id: u64,
-    pub sub_lease_id: u64,
-    pub sub_lessee: Address,
-    pub sub_escrow_vault_id: u64,
-}
-
-#[contractevent]
-pub struct SubleaseTerminated {
-    pub master_lease_id: u64,
-    pub sub_lease_id: u64,
-    pub reason: String,
+    pub original_asset: Address,
+    pub collateral_asset: Address,
+    pub swap_path: Vec<Address>,
+    pub original_amount: i128,
+    pub final_locked_amount: i128,
 }
 
 #[contracterror]
@@ -441,22 +379,8 @@ pub enum LeaseError {
     NotAnArbitrator = 14,
     LeaseAlreadyExists = 15,
     UpgradeNotAllowed = 16,
-    InvalidProrationMath = 17,
-    FlashLoanAttemptBlocked = 18,
-    SettlementPeriodNotElapsed = 19,
-    DisputeWindowExpired = 20,
-    InsufficientDisputeBond = 21,
-    DisputeAlreadyActive = 22,
-    JurorNotFound = 23,
-    InsufficientJurorStake = 24,
-    JurorSelectionFailed = 25,
-    VerdictDeadlinePassed = 26,
-    InsufficientJurorVotes = 27,
-    SubleasingNotAllowed = 28,
-    SubleaseBoundaryExceeded = 29,
-    MasterLeaseNotFound = 30,
-    SubEscrowVaultNotFound = 31,
-    JurorReputationTooLow = 32,
+    PathPaymentFailed = 17,
+    SlippageExceeded = 18,
 }
 
 macro_rules! require {
@@ -684,6 +608,21 @@ mod kyc_contract {
     }
 }
 
+mod dex_contract {
+    use soroban_sdk::{contractclient, Address, Env, Vec};
+    #[contractclient(name = "DexClient")]
+    pub trait DexInterface {
+        fn path_payment(
+            env: Env,
+            from: Address,
+            to: Address,
+            amount_in: i128,
+            max_slippage_bps: u32,
+            path: Vec<Address>,
+        ) -> Result<i128, i32>;
+    }
+}
+
 #[contract]
 pub struct LeaseContract;
 
@@ -694,6 +633,56 @@ impl LeaseContract {
             return Err(LeaseError::InvalidAsset);
         }
         Ok(())
+    }
+
+    fn execute_deposit_swap(
+        env: &Env,
+        lease_id: u64,
+        tenant: &Address,
+        original_asset: &Address,
+        collateral_asset: &Address,
+        original_amount: i128,
+        max_slippage_bps: u32,
+        swap_path: &Vec<Address>,
+        dex_contract: &Option<Address>,
+    ) -> Result<i128, LeaseError> {
+        if original_asset == collateral_asset {
+            return Ok(original_amount);
+        }
+        if swap_path.is_empty() {
+            return Err(LeaseError::PathPaymentFailed);
+        }
+        let final_locked_amount = if let Some(dex_addr) = dex_contract {
+            let dex_client = dex_contract::DexClient::new(env, dex_addr);
+            dex_client
+                .path_payment(
+                    tenant.clone(),
+                    collateral_asset.clone(),
+                    original_amount,
+                    max_slippage_bps,
+                    swap_path.clone(),
+                )
+                .map_err(|_| LeaseError::PathPaymentFailed)?
+        } else {
+            let simulated_output = original_amount.saturating_mul(9_900) / 10_000;
+            let min_out = original_amount.saturating_mul(10_000i128 - max_slippage_bps as i128)
+                / 10_000i128;
+            if simulated_output < min_out {
+                return Err(LeaseError::SlippageExceeded);
+            }
+            simulated_output
+        };
+        CrossAssetDepositLocked {
+            lease_id,
+            original_asset: original_asset.clone(),
+            collateral_asset: collateral_asset.clone(),
+            swap_path: swap_path.clone(),
+            original_amount,
+            final_locked_amount,
+        }
+        .publish(env);
+        let _ = tenant;
+        Ok(final_locked_amount)
     }
 
     fn is_asset_allowed(env: &Env, token: &Address) -> bool {
@@ -1079,12 +1068,27 @@ impl LeaseContract {
         }
         landlord.require_auth();
         params.tenant.require_auth();
+        let locked_amount = if let Some(deposit_asset) = params.deposit_asset.clone() {
+            Self::execute_deposit_swap(
+                &env,
+                lease_id,
+                &params.tenant,
+                &deposit_asset,
+                &params.payment_token,
+                params.security_deposit,
+                params.max_slippage_bps,
+                &params.swap_path,
+                &params.dex_contract,
+            )?
+        } else {
+            params.security_deposit
+        };
         let lease = LeaseInstance {
             landlord,
             tenant: params.tenant,
             rent_amount: params.rent_amount,
             deposit_amount: params.deposit_amount,
-            security_deposit: params.security_deposit,
+            security_deposit: locked_amount,
             start_date: params.start_date,
             end_date: params.end_date,
             rent_paid_through: 0,
@@ -1112,12 +1116,22 @@ impl LeaseContract {
             withheld_rent: 0,
             repair_proof_hash: None,
             inspector: None,
-            wear_allowance_bps: params.wear_allowance_bps,
-            asset_lifespan_days: params.asset_lifespan_days,
-            asset_value: params.asset_value,
-            deposit_timestamp: env.ledger().timestamp(),
-            subleasing_allowed: params.subleasing_allowed,
-            master_lease_id: None,
+            paused: false,
+            pause_reason: None,
+            paused_at: None,
+            pause_initiator: None,
+            total_paused_duration: 0,
+            rent_pull_authorized_amount: None,
+            last_rent_pull_timestamp: None,
+            billing_cycle_duration: 2_592_000,
+            yield_delegation_enabled: params.yield_delegation_enabled,
+            yield_accumulated: 0,
+            equity_balance: 0,
+            equity_percentage_bps: params.equity_percentage_bps,
+            had_late_payment: false,
+            has_pet: params.has_pet,
+            pet_deposit_amount: params.pet_deposit_amount,
+            pet_rent_amount: params.pet_rent_amount,
         };
         save_lease_instance(&env, lease_id, &lease);
         LeaseSigned {
