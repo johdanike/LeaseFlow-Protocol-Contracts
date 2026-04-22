@@ -1885,4 +1885,281 @@ fn test_terminate_lease_no_bounty_without_platform_fee() {
     assert!(read_lease(&env, &contract_id, LEASE_ID).is_none());
 }
 
+#[test]
+fn test_mutual_deposit_release_success() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    
+    // Create and fund a lease with deposits
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.security_deposit = 800;
+    lease.deposit_amount = 200;
+    lease.status = LeaseStatus::Active;
+    lease.deposit_status = DepositStatus::Held;
+    seed_lease(&env, &contract_id, LEASE_ID, &lease);
+    
+    // Fund contract with tokens for the deposits
+    let token_id = env.register(TokenMock, ());
+    let token_client = TokenMockClient::new(&env, &token_id);
+    token_client.mint(&contract_id, &(lease.security_deposit + lease.deposit_amount));
+    
+    // Test successful mutual release - full refund to tenant
+    client.mutual_deposit_release(
+        &LEASE_ID,
+        &tenant,
+        &landlord,
+        &1000, // return_amount
+        &0,    // slash_amount
+    );
+    
+    // Verify lease is terminated
+    let updated_lease = read_lease(&env, &contract_id, LEASE_ID).unwrap();
+    assert_eq!(updated_lease.status, LeaseStatus::Terminated);
+    assert_eq!(updated_lease.deposit_status, DepositStatus::Settled);
+    assert!(!updated_lease.active);
+}
+
+#[test]
+fn test_mutual_deposit_release_partial_split() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    
+    // Create and fund a lease with deposits
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.security_deposit = 800;
+    lease.deposit_amount = 200;
+    lease.status = LeaseStatus::Active;
+    lease.deposit_status = DepositStatus::Held;
+    seed_lease(&env, &contract_id, LEASE_ID, &lease);
+    
+    // Fund contract with tokens for the deposits
+    let token_id = env.register(TokenMock, ());
+    let token_client = TokenMockClient::new(&env, &token_id);
+    token_client.mint(&contract_id, &(lease.security_deposit + lease.deposit_amount));
+    
+    // Test successful mutual release - partial split
+    client.mutual_deposit_release(
+        &LEASE_ID,
+        &tenant,
+        &landlord,
+        &600,  // return_amount to tenant
+        &400,  // slash_amount to landlord
+    );
+    
+    // Verify lease is terminated
+    let updated_lease = read_lease(&env, &contract_id, LEASE_ID).unwrap();
+    assert_eq!(updated_lease.status, LeaseStatus::Terminated);
+    assert_eq!(updated_lease.deposit_status, DepositStatus::Settled);
+}
+
+#[test]
+fn test_mutual_deposit_release_invalid_math() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.security_deposit = 800;
+    lease.deposit_amount = 200;
+    lease.status = LeaseStatus::Active;
+    lease.deposit_status = DepositStatus::Held;
+    seed_lease(&env, &contract_id, LEASE_ID, &lease);
+    
+    // Test invalid math - amounts don't sum to total
+    let result = client.try_mutual_deposit_release(
+        &LEASE_ID,
+        &tenant,
+        &landlord,
+        &500,  // return_amount
+        &300,  // slash_amount (sum = 800, but total = 1000)
+    );
+    
+    assert_eq!(result, Err(LeaseFlowError::InvalidReleaseMath));
+    
+    // Verify lease is not terminated
+    let updated_lease = read_lease(&env, &contract_id, LEASE_ID).unwrap();
+    assert_eq!(updated_lease.status, LeaseStatus::Active);
+    assert_eq!(updated_lease.deposit_status, DepositStatus::Held);
+}
+
+#[test]
+fn test_mutual_deposit_release_negative_amounts() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.security_deposit = 800;
+    lease.deposit_amount = 200;
+    lease.status = LeaseStatus::Active;
+    lease.deposit_status = DepositStatus::Held;
+    seed_lease(&env, &contract_id, LEASE_ID, &lease);
+    
+    // Test negative return amount
+    let result = client.try_mutual_deposit_release(
+        &LEASE_ID,
+        &tenant,
+        &landlord,
+        &-100, // negative return_amount
+        &1100, // slash_amount
+    );
+    
+    assert_eq!(result, Err(LeaseFlowError::InvalidReleaseMath));
+    
+    // Test negative slash amount
+    let result = client.try_mutual_deposit_release(
+        &LEASE_ID,
+        &tenant,
+        &landlord,
+        &1100, // return_amount
+        &-100, // negative slash_amount
+    );
+    
+    assert_eq!(result, Err(LeaseFlowError::InvalidReleaseMath));
+}
+
+#[test]
+fn test_mutual_deposit_release_unauthorized_parties() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let impostor = Address::generate(&env);
+    
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.security_deposit = 800;
+    lease.deposit_amount = 200;
+    lease.status = LeaseStatus::Active;
+    lease.deposit_status = DepositStatus::Held;
+    seed_lease(&env, &contract_id, LEASE_ID, &lease);
+    
+    // Test with wrong tenant
+    let result = client.try_mutual_deposit_release(
+        &LEASE_ID,
+        &impostor, // wrong tenant
+        &landlord,
+        &1000,
+        &0,
+    );
+    
+    assert_eq!(result, Err(LeaseFlowError::Unauthorised));
+    
+    // Test with wrong landlord
+    let result = client.try_mutual_deposit_release(
+        &LEASE_ID,
+        &tenant,
+        &impostor, // wrong landlord
+        &1000,
+        &0,
+    );
+    
+    assert_eq!(result, Err(LeaseFlowError::Unauthorised));
+}
+
+#[test]
+fn test_mutual_deposit_release_wrong_lease_state() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    
+    // Test with already terminated lease
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.security_deposit = 800;
+    lease.deposit_amount = 200;
+    lease.status = LeaseStatus::Terminated;
+    lease.deposit_status = DepositStatus::Held;
+    seed_lease(&env, &contract_id, LEASE_ID, &lease);
+    
+    let result = client.try_mutual_deposit_release(
+        &LEASE_ID,
+        &tenant,
+        &landlord,
+        &1000,
+        &0,
+    );
+    
+    assert_eq!(result, Err(LeaseFlowError::LeaseNotFound));
+}
+
+#[test]
+fn test_initiate_mutual_release_with_fallback() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.security_deposit = 800;
+    lease.deposit_amount = 200;
+    lease.status = LeaseStatus::Active;
+    lease.deposit_status = DepositStatus::Held;
+    seed_lease(&env, &contract_id, LEASE_ID, &lease);
+    
+    // Test fallback mechanism - should transition to dispute
+    client.initiate_mutual_release_with_fallback(
+        &LEASE_ID,
+        &tenant,
+        &600, // proposed return
+        &400, // proposed slash
+    );
+    
+    // Verify lease transitions to disputed state
+    let updated_lease = read_lease(&env, &contract_id, LEASE_ID).unwrap();
+    assert_eq!(updated_lease.status, LeaseStatus::Disputed);
+    assert_eq!(updated_lease.deposit_status, DepositStatus::Disputed);
+}
+
+#[test]
+fn test_mutual_release_with_nft() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    
+    // Create lease with NFT
+    let nft_id = env.register(NftMock, ());
+    let nft_client = NftMockClient::new(&env, &nft_id);
+    let token_id = 42;
+    
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.nft_contract = Some(nft_id);
+    lease.token_id = Some(token_id);
+    lease.security_deposit = 800;
+    lease.deposit_amount = 200;
+    lease.status = LeaseStatus::Active;
+    lease.deposit_status = DepositStatus::Held;
+    seed_lease(&env, &contract_id, LEASE_ID, &lease);
+    
+    // Mint NFT to contract
+    nft_client.mint(&contract_id, &token_id);
+    
+    // Fund contract with tokens
+    let token_id = env.register(TokenMock, ());
+    let token_client = TokenMockClient::new(&env, &token_id);
+    token_client.mint(&contract_id, &(lease.security_deposit + lease.deposit_amount));
+    
+    // Test mutual release with NFT return
+    client.mutual_deposit_release(
+        &LEASE_ID,
+        &tenant,
+        &landlord,
+        &1000,
+        &0,
+    );
+    
+    // Verify NFT is returned to landlord
+    assert_eq!(nft_client.owner_of(&token_id), landlord);
+    
+    // Verify lease is terminated
+    let updated_lease = read_lease(&env, &contract_id, LEASE_ID).unwrap();
+    assert_eq!(updated_lease.status, LeaseStatus::Terminated);
+}
+
 

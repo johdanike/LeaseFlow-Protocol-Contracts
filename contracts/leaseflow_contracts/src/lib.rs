@@ -324,6 +324,28 @@ pub struct CrossAssetDepositLocked {
     pub final_locked_amount: i128,
 }
 
+#[contractevent]
+pub struct LeaseSigned {
+    pub lease_id: u64,
+    pub property_hash: String,
+}
+
+#[contractevent]
+pub struct PaymentLate {
+    pub lease_id: u64,
+    pub days_late: u64,
+    pub current_fine: i128,
+}
+
+#[contractevent]
+pub struct MutualLeaseFinalized {
+    pub lease_id: u64,
+    pub return_amount: i128,
+    pub slash_amount: i128,
+    pub tenant_refund: i128,
+    pub landlord_payout: i128,
+}
+
 #[contracterror]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseError {
@@ -345,6 +367,7 @@ pub enum LeaseError {
     UpgradeNotAllowed = 16,
     PathPaymentFailed = 17,
     SlippageExceeded = 18,
+    InvalidReleaseMath = 19,
 }
 
 macro_rules! require {
@@ -1427,6 +1450,148 @@ impl LeaseContract {
         save_lease_instance(&env, lease_id, &lease);
 
         Ok(refund_amount)
+    }
+
+    pub fn mutual_deposit_release(
+        env: Env,
+        lease_id: u64,
+        lessee_pubkey: Address,
+        lessor_pubkey: Address,
+        return_amount: i128,
+        slash_amount: i128,
+    ) -> Result<(), LeaseError> {
+        let mut lease =
+            load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+
+        // Verify that both parties are the actual lease participants
+        if lessee_pubkey != lease.tenant || lessor_pubkey != lease.landlord {
+            return Err(LeaseError::Unauthorised);
+        }
+
+        // Verify both parties have authorized this transaction
+        lessee_pubkey.require_auth();
+        lessor_pubkey.require_auth();
+
+        // Validate lease is in a state that allows mutual release
+        if lease.status != LeaseStatus::Active && lease.status != LeaseStatus::Expired {
+            return Err(LeaseError::LeaseNotFound);
+        }
+
+        // Mathematical validation: ensure amounts sum to total escrowed deposit
+        let total_escrowed = lease.security_deposit + lease.deposit_amount;
+        if return_amount + slash_amount != total_escrowed {
+            return Err(LeaseError::InvalidReleaseMath);
+        }
+
+        // Ensure amounts are non-negative
+        if return_amount < 0 || slash_amount < 0 {
+            return Err(LeaseError::InvalidReleaseMath);
+        }
+
+        // Calculate the split: return_amount goes to tenant, slash_amount goes to landlord
+        let tenant_refund = return_amount;
+        let landlord_payout = slash_amount;
+
+        // Execute atomic transfers
+        if tenant_refund > 0 {
+            let token_client = token_contract::TokenClient::new(&env, &lease.payment_token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &lease.tenant,
+                &tenant_refund,
+            );
+        }
+
+        if landlord_payout > 0 {
+            let token_client = token_contract::TokenClient::new(&env, &lease.payment_token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &lease.landlord,
+                &landlord_payout,
+            );
+        }
+
+        // Update lease state to finalized
+        lease.status = LeaseStatus::Terminated;
+        lease.deposit_status = DepositStatus::Settled;
+        lease.active = false;
+
+        // Handle NFT return if applicable
+        if let (Some(nft_contract_addr), Some(token_id)) =
+            (lease.nft_contract.clone(), lease.token_id)
+        {
+            delete_usage_rights(&env, nft_contract_addr.clone(), token_id);
+            let nft_client = nft_contract::NftClient::new(&env, &nft_contract_addr);
+            nft_client.transfer_from(
+                &env.current_contract_address(),
+                &env.current_contract_address(),
+                &lease.landlord,
+                &token_id,
+            );
+        }
+
+        save_lease_instance(&env, lease_id, &lease);
+
+        // Emit the mutual lease finalized event
+        MutualLeaseFinalized {
+            lease_id,
+            return_amount,
+            slash_amount,
+            tenant_refund,
+            landlord_payout,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn initiate_mutual_release_with_fallback(
+        env: Env,
+        lease_id: u64,
+        initiator_pubkey: Address,
+        proposed_return_amount: i128,
+        proposed_slash_amount: i128,
+    ) -> Result<(), LeaseError> {
+        let mut lease =
+            load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+
+        // Verify initiator is a lease participant
+        if initiator_pubkey != lease.tenant && initiator_pubkey != lease.landlord {
+            return Err(LeaseError::Unauthorised);
+        }
+
+        initiator_pubkey.require_auth();
+
+        // Validate lease is in a state that allows mutual release attempt
+        if lease.status != LeaseStatus::Active && lease.status != LeaseStatus::Expired {
+            return Err(LeaseError::LeaseNotFound);
+        }
+
+        // Mathematical validation of proposed amounts
+        let total_escrowed = lease.security_deposit + lease.deposit_amount;
+        if proposed_return_amount + proposed_slash_amount != total_escrowed {
+            return Err(LeaseError::InvalidReleaseMath);
+        }
+
+        // Ensure amounts are non-negative
+        if proposed_return_amount < 0 || proposed_slash_amount < 0 {
+            return Err(LeaseError::InvalidReleaseMath);
+        }
+
+        // In a real implementation, this would store the proposal and wait for the counterparty
+        // For now, we immediately transition to dispute state to demonstrate the fallback
+        lease.deposit_status = DepositStatus::Disputed;
+        lease.status = LeaseStatus::Disputed;
+
+        save_lease_instance(&env, lease_id, &lease);
+
+        // Emit dispute event to trigger Oracle intervention
+        DepositDisputed { 
+            lease_id, 
+            caller: initiator_pubkey 
+        }.publish(&env);
+
+        Ok(())
     }
 
     pub fn check_tenant_default(env: Env, lease_id: u64) -> Result<i128, LeaseError> {
