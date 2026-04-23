@@ -1578,49 +1578,49 @@ impl LeaseContract {
         tenant: Address,
     ) -> Result<(), LeaseError> {
         tenant.require_auth();
-        
+
         let mut lease = load_lease_instance_by_id(&env, lease_id)
             .ok_or(LeaseError::LeaseNotFound)?;
-        
+
         // Only tenant can execute early termination
         if lease.tenant != tenant {
             return Err(LeaseError::Unauthorised);
         }
-        
+
         // Lease must be active
         if !lease.active || lease.status != LeaseStatus::Active {
             return Err(LeaseError::LeaseNotFound);
         }
-        
+
         let current_time = env.ledger().timestamp();
-        
+
         // Cannot terminate after end date (use normal termination)
         if current_time >= lease.end_date {
             return Err(LeaseError::LeaseNotExpired);
         }
-        
+
         // Flash loan protection: Check tenant's balance before and after
         // This prevents tenants from using flash loans to temporarily inflate balances
         let token_client = token_contract::TokenClient::new(&env, &lease.payment_token);
         let tenant_balance_before = token_client.balance(&tenant);
-        
+
         // Require minimum balance to prevent flash loan manipulation
         // Tenant must have at least the security deposit amount naturally
         if tenant_balance_before < lease.security_deposit {
             return Err(LeaseError::Unauthorised);
         }
-        
+
         let total_lease_duration = lease.end_date - lease.start_date;
         let elapsed_duration = current_time - lease.start_date;
         let duration_remaining = lease.end_date - current_time;
-        
+
         // Calculate remaining unpaid lease value
         let remaining_lease_value = if lease.rent_per_sec > 0 {
             (duration_remaining as i128).saturating_mul(lease.rent_per_sec)
         } else {
             0
         };
-        
+
         // Calculate penalty based on lease configuration
         let penalty_amount = match (lease.early_termination_fee_bps, lease.fixed_penalty) {
             (Some(fee_bps), _) => {
@@ -1636,11 +1636,11 @@ impl LeaseContract {
                 0
             }
         };
-        
+
         // Ensure penalty doesn't exceed security deposit
         let final_penalty = penalty_amount.min(lease.security_deposit);
         let remaining_deposit = lease.security_deposit - final_penalty;
-        
+
         // Handle case where penalty exceeds entire deposit
         if penalty_amount > lease.security_deposit {
             // Flag tenant as defaulted
@@ -1650,7 +1650,7 @@ impl LeaseContract {
                 .persistent()
                 .extend_ttl(&defaulted_key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
         }
-        
+
         // Transfer penalty to landlord
         if final_penalty > 0 {
             let token_client = token_contract::TokenClient::new(&env, &lease.payment_token);
@@ -1660,7 +1660,7 @@ impl LeaseContract {
                 &final_penalty,
             );
         }
-        
+
         // Transfer remaining deposit back to tenant
         if remaining_deposit > 0 {
             let token_client = token_contract::TokenClient::new(&env, &lease.payment_token);
@@ -1670,10 +1670,10 @@ impl LeaseContract {
                 &remaining_deposit,
             );
         }
-        
+
         // Flash loan protection: Verify tenant still has sufficient balance after operations
         let tenant_balance_after = token_client.balance(&tenant);
-        
+
         // Tenant should still have a reasonable buffer after penalty deduction
         // This prevents flash loan attacks where temporary funds are used and immediately withdrawn
         let min_buffer = lease.security_deposit / 10; // 10% buffer
@@ -1681,12 +1681,12 @@ impl LeaseContract {
             // This could indicate flash loan manipulation, revert the transaction
             return Err(LeaseError::Unauthorised);
         }
-        
+
         // Update lease status
         lease.status = LeaseStatus::Terminated;
         lease.active = false;
         lease.deposit_status = DepositStatus::Settled;
-        
+
         // Handle NFT return if present
         if let (Some(nft_contract), Some(token_id)) = (&lease.nft_contract, &lease.token_id) {
             delete_usage_rights(&env, nft_contract.clone(), *token_id);
@@ -1698,10 +1698,10 @@ impl LeaseContract {
                 token_id,
             );
         }
-        
+
         // Archive the lease
         archive_lease(&env, lease_id, lease.clone(), tenant.clone());
-        
+
         // Emit event
         EarlyTerminationExecuted {
             lease_id,
@@ -1712,7 +1712,7 @@ impl LeaseContract {
             duration_remaining,
             total_lease_duration,
         }.publish(&env);
-        
+
         Ok(())
     }
 }

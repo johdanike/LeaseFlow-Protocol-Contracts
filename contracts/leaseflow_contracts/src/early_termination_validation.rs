@@ -15,7 +15,7 @@
 
 // Test case 2: 50% completion with 20% penalty
 // Lease duration: 30 days
-// Rent per second: 1 unit  
+// Rent per second: 1 unit
 // Security deposit: 500 units
 // Early termination fee: 2000 bps (20%)
 // Time elapsed: 1,296,000 seconds (50% of lease)
@@ -74,7 +74,7 @@
 // EarlyTerminationExecuted event should include:
 // - lease_id
 // - tenant address
-// - landlord address  
+// - landlord address
 // - penalty_amount (final penalty after capping)
 // - remaining_deposit (amount returned to tenant)
 // - duration_remaining (seconds remaining in lease)
