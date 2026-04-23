@@ -111,16 +111,26 @@ fn make_lease(env: &Env, landlord: &Address, tenant: &Address) -> LeaseInstance 
         withdrawal_address: None,
         rent_withdrawn: 0,
         arbitrators: soroban_sdk::Vec::new(env),
-        maintenance_status: MaintenanceStatus::None,
-        withheld_rent: 0,
-        repair_proof_hash: None,
-        inspector: None,
-        wear_allowance_bps: 500, // 5% wear allowance
-        asset_lifespan_days: 3650, // 10 years
-        asset_value: 100_000, // Asset value in stroops
-        deposit_timestamp: START,
-        subleasing_allowed: true,
-        master_lease_id: None,
+        // Emergency pause fields
+        paused: false,
+        pause_reason: None,
+        paused_at: None,
+        pause_initiator: None,
+        total_paused_duration: 0,
+        rent_pull_authorized_amount: None,
+        last_rent_pull_timestamp: None,
+        billing_cycle_duration: 2_592_000,
+        // New Features
+        yield_delegation_enabled: false,
+        yield_accumulated: 0,
+        equity_balance: 0,
+        equity_percentage_bps: 0,
+        had_late_payment: false,
+        has_pet: false,
+        pet_deposit_amount: 0,
+        pet_rent_amount: 0,
+        early_termination_fee_bps: None,
+        fixed_penalty: None,
     }
 }
 
@@ -786,6 +796,8 @@ fn test_maintenance_flow_with_events() {
         dex_contract: None,
         max_slippage_bps: 0,
         swap_path: soroban_sdk::Vec::new(&env),
+        early_termination_fee_bps: None,
+        fixed_penalty: None,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -817,6 +829,8 @@ fn test_maintenance_flow_with_events() {
         dex_contract: None,
         max_slippage_bps: 0,
         swap_path: soroban_sdk::Vec::new(&env),
+        early_termination_fee_bps: None,
+        fixed_penalty: None,
     };
 
     let params_2 = CreateLeaseParams {
@@ -842,6 +856,8 @@ fn test_maintenance_flow_with_events() {
         dex_contract: None,
         max_slippage_bps: 0,
         swap_path: soroban_sdk::Vec::new(&env),
+        early_termination_fee_bps: None,
+        fixed_penalty: None,
     };
 
     client.create_lease_instance(&lease_id_1, &landlord, &params_1);
@@ -902,6 +918,8 @@ fn test_lease_instance_buyout() {
         dex_contract: None,
         max_slippage_bps: 0,
         swap_path: soroban_sdk::Vec::new(&env),
+        early_termination_fee_bps: None,
+        fixed_penalty: None,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -956,6 +974,8 @@ fn test_buyout_price_not_reached() {
         dex_contract: None,
         max_slippage_bps: 0,
         swap_path: soroban_sdk::Vec::new(&env),
+        early_termination_fee_bps: None,
+        fixed_penalty: None,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1092,6 +1112,8 @@ fn test_create_lease_instance_with_security_deposit() {
         dex_contract: None,
         max_slippage_bps: 0,
         swap_path: soroban_sdk::Vec::new(&env),
+        early_termination_fee_bps: None,
+        fixed_penalty: None,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1260,6 +1282,8 @@ fn test_double_sign_prevention() {
         dex_contract: None,
         max_slippage_bps: 0,
         swap_path: soroban_sdk::Vec::new(&env),
+        early_termination_fee_bps: None,
+        fixed_penalty: None,
     };
 
     let result = client.try_create_lease_instance(&lease_id, &landlord, &params);
@@ -1316,6 +1340,8 @@ fn test_utility_billing_request_success() {
         dex_contract: None,
         max_slippage_bps: 0,
         swap_path: soroban_sdk::Vec::new(&env),
+        early_termination_fee_bps: None,
+        fixed_penalty: None,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1369,6 +1395,8 @@ fn test_utility_billing_unauthorized_landlord() {
         dex_contract: None,
         max_slippage_bps: 0,
         swap_path: soroban_sdk::Vec::new(&env),
+        early_termination_fee_bps: None,
+        fixed_penalty: None,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1412,6 +1440,8 @@ fn test_utility_billing_invalid_amount() {
         dex_contract: None,
         max_slippage_bps: 0,
         swap_path: soroban_sdk::Vec::new(&env),
+        early_termination_fee_bps: None,
+        fixed_penalty: None,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1455,6 +1485,8 @@ fn test_utility_bill_payment_success() {
         dex_contract: None,
         max_slippage_bps: 0,
         swap_path: soroban_sdk::Vec::new(&env),
+        early_termination_fee_bps: None,
+        fixed_penalty: None,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1505,6 +1537,8 @@ fn test_utility_bill_payment_expired() {
         dex_contract: None,
         max_slippage_bps: 0,
         swap_path: soroban_sdk::Vec::new(&env),
+        early_termination_fee_bps: None,
+        fixed_penalty: None,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1553,6 +1587,8 @@ fn test_utility_bill_wrong_payment_amount() {
         dex_contract: None,
         max_slippage_bps: 0,
         swap_path: soroban_sdk::Vec::new(&env),
+        early_termination_fee_bps: None,
+        fixed_penalty: None,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1603,6 +1639,8 @@ fn test_sublet_authorization_success() {
         dex_contract: None,
         max_slippage_bps: 0,
         swap_path: soroban_sdk::Vec::new(&env),
+        early_termination_fee_bps: None,
+        fixed_penalty: None,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1671,6 +1709,8 @@ fn test_sublet_invalid_percentage_split() {
         dex_contract: None,
         max_slippage_bps: 0,
         swap_path: soroban_sdk::Vec::new(&env),
+        early_termination_fee_bps: None,
+        fixed_penalty: None,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1726,6 +1766,8 @@ fn test_sublet_invalid_dates() {
         dex_contract: None,
         max_slippage_bps: 0,
         swap_path: soroban_sdk::Vec::new(&env),
+        early_termination_fee_bps: None,
+        fixed_penalty: None,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1782,6 +1824,8 @@ fn test_sublet_rent_payment_success() {
         dex_contract: None,
         max_slippage_bps: 0,
         swap_path: soroban_sdk::Vec::new(&env),
+        early_termination_fee_bps: None,
+        fixed_penalty: None,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1850,6 +1894,8 @@ fn test_sublet_termination_success() {
         dex_contract: None,
         max_slippage_bps: 0,
         swap_path: soroban_sdk::Vec::new(&env),
+        early_termination_fee_bps: None,
+        fixed_penalty: None,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
