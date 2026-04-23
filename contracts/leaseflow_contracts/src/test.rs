@@ -6,9 +6,10 @@
 
 use super::*;
 use crate::{
-    CreateLeaseParams, DataKey, DepositStatus, HistoricalLease, LeaseContract, LeaseContractClient,
-    LeaseStatus, MaintenanceStatus, RateType, SubletStatus, UtilityBillStatus,
+    CreateLeaseParams, CreateSubleaseParams, DataKey, DepositStatus, HistoricalLease, LeaseContract, LeaseContractClient,
+    LeaseStatus, MaintenanceStatus, RateType,
 };
+use crate::{JUROR_SLASH_AMOUNT, JUROR_VOTE_DEADLINE_HOURS};
 use soroban_sdk::{
     contract, contractclient, contractimpl, symbol_short,
     testutils::{Address as _, Ledger},
@@ -117,6 +118,8 @@ fn make_lease(env: &Env, landlord: &Address, tenant: &Address) -> LeaseInstance 
         asset_lifespan_days: 3650, // 10 years
         asset_value: 100_000, // Asset value in stroops
         deposit_timestamp: START,
+        subleasing_allowed: true,
+        master_lease_id: None,
     }
 }
 
