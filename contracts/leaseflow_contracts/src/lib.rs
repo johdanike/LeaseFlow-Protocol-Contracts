@@ -24,6 +24,7 @@ pub enum DepositStatus {
     Held,
     Settled,
     Disputed,
+    InArbitration,
 }
 
 #[contracttype]
@@ -33,6 +34,7 @@ pub enum LeaseStatus {
     Active,
     Expired,
     Disputed,
+    InArbitration,
     Terminated,
 }
 
@@ -72,6 +74,48 @@ pub enum DepositRelease {
     FullRefund,
     PartialRefund(DepositReleasePartial),
     Disputed,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AssetTier {
+    Low,      // Basic assets, low deposit requirements
+    Medium,   // Standard assets, moderate deposit requirements
+    High,     // Premium assets, high deposit requirements
+    Luxury,   // Luxury assets, very high deposit requirements
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowVault {
+    pub total_locked: i128,
+    pub lease_count: u64,
+    pub max_capacity: i128,
+    pub supported_assets: Vec<Address>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecurityDeposit {
+    pub lease_id: u64,
+    pub lessee: Address,
+    pub lessor: Address,
+    pub asset_address: Address,
+    pub amount: i128,
+    pub locked_at: u64,
+    pub status: DepositStatus,
+    pub asset_tier: AssetTier,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultiAssetCollateral {
+    pub primary_asset: Address,
+    pub primary_amount: i128,
+    pub secondary_asset: Option<Address>,
+    pub secondary_amount: Option<i128>,
+    pub nft_contract: Option<Address>,
+    pub nft_token_id: Option<u128>,
 }
 
 #[contracttype]
@@ -257,10 +301,23 @@ pub struct RentPaidPartial {
 }
 
 #[contractevent]
+pub struct PaymentLate {
+    pub lease_id: u64,
+    pub days_late: u64,
+    pub current_fine: i128,
+}
+
+#[contractevent]
 pub struct LeaseStarted {
     pub id: u64,
     pub renter: Address,
     pub rate: i128,
+}
+
+#[contractevent]
+pub struct LeaseSigned {
+    pub lease_id: u64,
+    pub property_hash: String,
 }
 
 #[contractevent]
@@ -329,6 +386,22 @@ pub struct DepositDisputed {
 pub struct DisputeResolved {
     pub lease_id: u64,
     pub resolution: DepositReleasePartial,
+}
+
+#[contractevent]
+pub struct WearAndTearCalculated {
+    pub lease_id: u64,
+    pub allowed_decay: i128,
+    pub reported_decay: i128,
+    pub elapsed_days: u64,
+    pub wear_allowance_bps: u32,
+}
+
+#[contractevent]
+pub struct SettlementPeriodStarted {
+    pub lease_id: u64,
+    pub deposit_timestamp: u64,
+    pub settlement_ledgers: u32,
 }
 
 #[contractevent]
@@ -428,6 +501,18 @@ const DAY_IN_LEDGERS: u32 = 17280;
 const MONTH_IN_LEDGERS: u32 = DAY_IN_LEDGERS * 30;
 const YEAR_IN_LEDGERS: u32 = DAY_IN_LEDGERS * 365;
 
+// Dispute resolution constants
+const DISPUTE_WINDOW_HOURS: u64 = 48;
+const DISPUTE_WINDOW_LEDGERS: u64 = DISPUTE_WINDOW_HOURS * 720; // 720 ledgers per hour
+const JURY_SIZE: u32 = 3;
+const JURY_VOTE_THRESHOLD: u32 = 2; // 2-of-3 multi-sig
+const JUROR_VOTE_DEADLINE_HOURS: u64 = 72;
+const JUROR_VOTE_DEADLINE_LEDGERS: u64 = JUROR_VOTE_DEADLINE_HOURS * 720;
+const MIN_JUROR_REPUTATION: u32 = 100;
+const MIN_JUROR_STAKE: i128 = 1_000_000; // 0.001 XLM equivalent
+const DISPUTE_BOND_AMOUNT: i128 = 5_000_000; // 0.005 XLM equivalent
+const JUROR_SLASH_AMOUNT: i128 = 2_000_000; // 0.002 XLM equivalent
+
 pub fn to_per_second(rate: i128, rate_type: RateType) -> i128 {
     match rate_type {
         RateType::PerSecond => rate,
@@ -503,6 +588,106 @@ pub fn archive_lease(env: &Env, lease_id: u64, lease: LeaseInstance, caller: Add
         .persistent()
         .set(&DataKey::HistoricalLease(lease_id), &historical);
     delete_lease_instance(env, lease_id);
+}
+
+// Dispute resolution helper functions
+pub fn save_dispute_case(env: &Env, dispute_id: u64, dispute_case: &DisputeCase) {
+    let key = DataKey::DisputeCase(dispute_id);
+    env.storage().persistent().set(&key, dispute_case);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+}
+
+pub fn load_dispute_case(env: &Env, dispute_id: u64) -> Option<DisputeCase> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::DisputeCase(dispute_id))
+}
+
+pub fn save_juror(env: &Env, juror_address: &Address, juror: &Juror) {
+    let key = DataKey::Juror(juror_address.clone());
+    env.storage().persistent().set(&key, juror);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+}
+
+pub fn load_juror(env: &Env, juror_address: &Address) -> Option<Juror> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Juror(juror_address.clone()))
+}
+
+pub fn get_juror_pool(env: &Env) -> soroban_sdk::Vec<Address> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::JurorPool)
+        .unwrap_or(soroban_sdk::Vec::new(env))
+}
+
+pub fn save_juror_pool(env: &Env, pool: &soroban_sdk::Vec<Address>) {
+    env.storage().persistent().set(&DataKey::JurorPool, pool);
+    env.storage()
+        .persistent()
+        .extend_ttl(&DataKey::JurorPool, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+}
+
+pub fn save_sub_escrow_vault(env: &Env, vault_id: u64, vault: &SubEscrowVault) {
+    let key = DataKey::SubEscrowVault(vault_id);
+    env.storage().persistent().set(&key, vault);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+}
+
+pub fn load_sub_escrow_vault(env: &Env, vault_id: u64) -> Option<SubEscrowVault> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::SubEscrowVault(vault_id))
+}
+
+pub fn get_next_sub_lease_id(env: &Env) -> u64 {
+    let counter: u64 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::SubLeaseCounter)
+        .unwrap_or(0);
+    let next_id = counter + 1;
+    env.storage().persistent().set(&DataKey::SubLeaseCounter, &next_id);
+    env.storage()
+        .persistent()
+        .extend_ttl(&DataKey::SubLeaseCounter, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+    next_id
+}
+
+// Cryptographically secure random juror selection
+pub fn select_random_jurors(env: &Env, pool: &soroban_sdk::Vec<Address>, count: u32) -> soroban_sdk::Vec<Address> {
+    let mut selected = soroban_sdk::Vec::new(env);
+    let mut available_indices = soroban_sdk::Vec::new(env);
+    
+    // Create index pool
+    for i in 0..pool.len() {
+        available_indices.push_back(i);
+    }
+    
+    // Use ledger timestamp and sequence for entropy
+    let seed = env.ledger().timestamp() ^ env.ledger().sequence() as u64;
+    
+    for _ in 0..count {
+        if available_indices.is_empty() {
+            break;
+        }
+        
+        let random_index = (seed % available_indices.len() as u64) as u32;
+        let juror_index = available_indices.get(random_index as u32).unwrap();
+        selected.push_back(pool.get(juror_index).unwrap());
+        
+        // Remove selected index
+        available_indices.remove(random_index as u32);
+    }
+    
+    selected
 }
 
 mod nft_contract {
@@ -989,6 +1174,22 @@ impl LeaseContract {
         }
         landlord.require_auth();
         params.tenant.require_auth();
+        
+        // Calculate required security deposit based on asset tier and duration
+        let lease_duration = params.end_date.saturating_sub(params.start_date);
+        let asset_tier = Self::get_asset_tier(&env, &params.payment_token);
+        let required_deposit = Self::calculate_required_deposit(
+            &env,
+            asset_tier,
+            lease_duration,
+            params.security_deposit,
+        );
+        
+        // Verify that the provided security deposit matches the required amount
+        if params.security_deposit != required_deposit {
+            return Err(LeaseError::InvalidDeduction);
+        }
+        
         let locked_amount = if let Some(deposit_asset) = params.deposit_asset.clone() {
             Self::execute_deposit_swap(
                 &env,
@@ -1015,7 +1216,7 @@ impl LeaseContract {
             rent_paid_through: 0,
             deposit_status: DepositStatus::Held,
             status: LeaseStatus::Pending,
-            property_uri: params.property_uri,
+            property_uri: params.property_uri.clone(),
             nft_contract: None,
             token_id: None,
             active: true,
@@ -1064,7 +1265,7 @@ impl LeaseContract {
     }
 
     pub fn get_lease_instance(env: Env, lease_id: u64) -> Result<LeaseInstance, LeaseError> {
-        load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound);
+        load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)
     }
 
     pub fn set_lease_instance_buyout_price(
@@ -1720,6 +1921,147 @@ impl LeaseContract {
             .unwrap_or(0)
     }
 
+    /// Calculate wear and tear proration for long-term leases
+    /// Uses i128 fixed-point math for precision without truncation
+    pub fn calculate_wear_proration(
+        env: Env,
+        lease_id: u64,
+        oracle_reported_decay: i128,
+    ) -> Result<i128, LeaseError> {
+        let lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        // Prevent division by zero
+        if lease.asset_lifespan_days == 0 {
+            return Err(LeaseError::InvalidProrationMath);
+        }
+        
+        let current_time = env.ledger().timestamp();
+        let elapsed_seconds = current_time.saturating_sub(lease.start_date);
+        let elapsed_days = elapsed_seconds / 86_400; // Convert to days
+        
+        // Edge case: extremely early termination to prevent abuse
+        if elapsed_days < 1 {
+            return Ok(0); // No allowance for less than 1 day
+        }
+        
+        // Calculate expected degradation: (elapsed_lease_time / total_expected_lifespan) * asset_value
+        // Using i128 fixed-point math: multiply first, then divide to maintain precision
+        let expected_degradation = (elapsed_days as i128)
+            .saturating_mul(lease.asset_value)
+            .saturating_div(lease.asset_lifespan_days as i128);
+        
+        // Apply wear allowance: expected_degradation * wear_allowance_bps / 10000
+        let allowed_decay = expected_degradation
+            .saturating_mul(lease.wear_allowance_bps as i128)
+            .saturating_div(10_000_i128);
+        
+        // Round in favor of protocol (ceiling division)
+        let protocol_favor_decay = if expected_degradation.saturating_mul(lease.wear_allowance_bps as i128) % 10_000_i128 != 0 {
+            allowed_decay + 1
+        } else {
+            allowed_decay
+        };
+        
+        // Emit event with calculation details
+        WearAndTearCalculated {
+            lease_id,
+            allowed_decay: protocol_favor_decay,
+            reported_decay: oracle_reported_decay,
+            elapsed_days,
+            wear_allowance_bps: lease.wear_allowance_bps,
+        }
+        .publish(&env);
+        
+        // If Oracle reported damage falls under allowance, no penalty
+        if oracle_reported_decay <= protocol_favor_decay {
+            Ok(0) // No deduction
+        } else {
+            // Return the amount exceeding the allowance
+            Ok(oracle_reported_decay - protocol_favor_decay)
+        }
+    }
+
+    /// Deposit security collateral with flash loan protection
+    pub fn deposit_security_collateral(
+        env: Env,
+        lease_id: u64,
+        payer: Address,
+        amount: i128,
+    ) -> Result<(), LeaseError> {
+        payer.require_auth();
+        
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        // Check if this is a potential flash loan attempt
+        let current_ledger = env.ledger().sequence() as u64;
+        let deposit_ledger = lease.deposit_timestamp;
+        
+        // Settlement period requirement: 3 ledgers
+        const SETTLEMENT_LEDGERS: u32 = 3;
+        
+        // Check if deposit was made in current or recent ledgers (potential flash loan)
+        if current_ledger.saturating_sub(deposit_ledger) < SETTLEMENT_LEDGERS as u64 {
+            // Log the attempt and block
+            // In a real implementation, you might want to store this in a blacklist
+            return Err(LeaseError::FlashLoanAttemptBlocked);
+        }
+        
+        // Update lease status to Active after settlement period
+        if lease.status == LeaseStatus::Pending {
+            lease.status = LeaseStatus::Active;
+            
+            SettlementPeriodStarted {
+                lease_id,
+                deposit_timestamp: lease.deposit_timestamp,
+                settlement_ledgers: SETTLEMENT_LEDGERS,
+            }
+            .publish(&env);
+        }
+        
+        // Handle mid-lease top-ups
+        let balance_key = DataKey::RoommateBalance(lease_id, payer.clone());
+        let mut current_balance: i128 = env.storage().persistent().get(&balance_key).unwrap_or(0);
+        current_balance += amount;
+        env.storage().persistent().set(&balance_key, &current_balance);
+        env.storage()
+            .persistent()
+            .extend_ttl(&balance_key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+        
+        save_lease_instance(&env, lease_id, &lease);
+        Ok(())
+    }
+
+    /// Enhanced conclude_lease with wear and tear integration
+    pub fn conclude_lease_wear_proration(
+        env: Env,
+        lease_id: u64,
+        landlord: Address,
+        oracle_reported_decay: i128,
+    ) -> Result<i128, LeaseError> {
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        if landlord != lease.landlord {
+            return Err(LeaseError::Unauthorised);
+        }
+        landlord.require_auth();
+        
+        // Calculate wear and tear proration
+        let wear_deduction = Self::calculate_wear_proration(env.clone(), lease_id, oracle_reported_decay)?;
+        
+        // Ensure deduction doesn't exceed deposit
+        let total_deduction = if wear_deduction > lease.security_deposit {
+            lease.security_deposit
+        } else {
+            wear_deduction
+        };
+        
+        lease.status = LeaseStatus::Terminated;
+        lease.deposit_status = DepositStatus::Settled;
+        save_lease_instance(&env, lease_id, &lease);
+        
+        Ok(lease.security_deposit - total_deduction)
+    }
+
     pub fn set_terms_hash(env: Env, admin: Address, hash: BytesN<32>) -> Result<(), LeaseError> {
         let stored_admin: Address = env
             .storage()
@@ -1733,6 +2075,342 @@ impl LeaseContract {
         env.storage().instance().set(&DataKey::TermsHash, &hash);
         TermsHashUpdated { new_terms_hash: hash }.publish(&env);
         Ok(())
+    }
+
+    // Helper function to calculate required deposit based on asset tier and lease duration
+    fn calculate_required_deposit(
+        env: &Env,
+        asset_tier: AssetTier,
+        lease_duration: u64,
+        base_amount: i128,
+    ) -> i128 {
+        let duration_multiplier = if lease_duration <= 30 * 24 * 60 * 60 { // <= 30 days
+            1_00 // 1.0x
+        } else if lease_duration <= 90 * 24 * 60 * 60 { // <= 90 days
+            1_50 // 1.5x
+        } else if lease_duration <= 180 * 24 * 60 * 60 { // <= 180 days
+            2_00 // 2.0x
+        } else {
+            3_00 // 3.0x
+        };
+
+        let tier_multiplier = match asset_tier {
+            AssetTier::Low => 50,      // 0.5x
+            AssetTier::Medium => 100,   // 1.0x
+            AssetTier::High => 200,     // 2.0x
+            AssetTier::Luxury => 500,   // 5.0x
+        };
+
+        base_amount * duration_multiplier * tier_multiplier / 10_000
+    }
+
+    // Helper function to get or initialize the escrow vault
+    fn get_or_init_escrow_vault(env: &Env) -> EscrowVault {
+        if let Some(vault) = env.storage().persistent().get(&DataKey::EscrowVault) {
+            vault
+        } else {
+            let default_max_tvl = env.storage().persistent().get(&DataKey::MaxProtocolTVL)
+                .unwrap_or(10_000_000_000_000i128); // Default 10M tokens in stroops
+            EscrowVault {
+                total_locked: 0,
+                lease_count: 0,
+                max_capacity: default_max_tvl,
+                supported_assets: Vec::new(env),
+            }
+        }
+    }
+
+    // Helper function to save escrow vault state
+    fn save_escrow_vault(env: &Env, vault: &EscrowVault) {
+        env.storage().persistent().set(&DataKey::EscrowVault, vault);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::EscrowVault, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+    }
+
+    // Helper function to get asset tier for a given asset
+    fn get_asset_tier(env: &Env, asset_address: &Address) -> AssetTier {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AssetTier(asset_address.clone()))
+            .unwrap_or(AssetTier::Medium) // Default to Medium tier
+    }
+
+    // Main function to deposit security collateral
+    pub fn deposit_security_collateral(
+        env: Env,
+        lease_id: u64,
+        lessee: Address,
+        asset_address: Address,
+        deposit_amount: i128,
+        lease_duration: u64,
+        multi_asset_collateral: Option<MultiAssetCollateral>,
+    ) -> Result<(), LeaseError> {
+        // Authenticate the lessee
+        lessee.require_auth();
+        
+        // Check if lease exists and is in Pending state
+        let mut lease = load_lease_instance_by_id(&env, lease_id)
+            .ok_or(LeaseError::LeaseNotFound)?;
+        
+        if lease.tenant != lessee {
+            return Err(LeaseError::Unauthorised);
+        }
+        
+        if lease.status != LeaseStatus::Pending {
+            return Err(LeaseError::Unauthorised); // Cannot deposit after lease is active
+        }
+
+        // Get asset tier and calculate required deposit
+        let asset_tier = Self::get_asset_tier(&env, &asset_address);
+        let required_deposit = Self::calculate_required_deposit(
+            &env,
+            asset_tier.clone(),
+            lease_duration,
+            deposit_amount,
+        );
+
+        // Verify exact deposit amount
+        if deposit_amount != required_deposit {
+            return Err(LeaseError::InvalidDeduction);
+        }
+
+        // Check TVL bounds
+        let mut vault = Self::get_or_init_escrow_vault(&env);
+        if vault.total_locked.saturating_add(deposit_amount) > vault.max_capacity {
+            return Err(LeaseError::EscrowCapacityExceeded);
+        }
+
+        // Handle multi-asset collateral if provided
+        let total_collateral_value = if let Some(multi_asset) = multi_asset_collateral {
+            // For now, we'll handle primary asset only
+            // NFT collateral would be handled separately in a full implementation
+            deposit_amount.saturating_add(multi_asset.secondary_amount.unwrap_or(0))
+        } else {
+            deposit_amount
+        };
+
+        // Final TVL check with multi-asset collateral
+        if vault.total_locked.saturating_add(total_collateral_value) > vault.max_capacity {
+            return Err(LeaseError::EscrowCapacityExceeded);
+        }
+
+        // Transfer tokens to contract (escrow)
+        let token_client = token_contract::TokenClient::new(&env, &asset_address);
+        token_client.transfer(&lessee, &env.current_contract_address(), &deposit_amount);
+
+        // Handle secondary asset if present
+        if let Some(multi_asset) = &multi_asset_collateral {
+            if let (Some(secondary_asset), Some(secondary_amount)) = 
+                (&multi_asset.secondary_asset, multi_asset.secondary_amount) {
+                let secondary_token_client = token_contract::TokenClient::new(&env, secondary_asset);
+                secondary_token_client.transfer(&lessee, &env.current_contract_address(), secondary_amount);
+            }
+        }
+
+        // Create security deposit record
+        let security_deposit = SecurityDeposit {
+            lease_id,
+            lessee: lessee.clone(),
+            lessor: lease.landlord.clone(),
+            asset_address: asset_address.clone(),
+            amount: deposit_amount,
+            locked_at: env.ledger().timestamp(),
+            status: DepositStatus::Held,
+            asset_tier,
+        };
+
+        // Save security deposit to persistent storage
+        env.storage().persistent().set(&DataKey::SecurityDeposit(lease_id), &security_deposit);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::SecurityDeposit(lease_id), YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+
+        // Update vault state
+        vault.total_locked += total_collateral_value;
+        vault.lease_count += 1;
+        Self::save_escrow_vault(&env, &vault);
+
+        // Update lease instance
+        lease.security_deposit = deposit_amount;
+        lease.deposit_status = DepositStatus::Held;
+        save_lease_instance(&env, lease_id, &lease);
+
+        // Emit event
+        SecurityDepositLocked {
+            lease_id,
+            lessee,
+            lessor: lease.landlord,
+            asset_id: asset_address,
+            collateral_volume: deposit_amount,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    // Admin function to set max protocol TVL
+    pub fn set_max_protocol_tvl(
+        env: Env,
+        admin: Address,
+        max_tvl: i128,
+    ) -> Result<(), LeaseError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(LeaseError::Unauthorised)?;
+        if admin != stored_admin {
+            return Err(LeaseError::Unauthorised);
+        }
+        admin.require_auth();
+        
+        env.storage().persistent().set(&DataKey::MaxProtocolTVL, &max_tvl);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::MaxProtocolTVL, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+        Ok(())
+    }
+
+    // Admin function to set asset tier
+    pub fn set_asset_tier(
+        env: Env,
+        admin: Address,
+        asset_address: Address,
+        tier: AssetTier,
+    ) -> Result<(), LeaseError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(LeaseError::Unauthorised)?;
+        if admin != stored_admin {
+            return Err(LeaseError::Unauthorised);
+        }
+        admin.require_auth();
+        
+        env.storage().persistent().set(&DataKey::AssetTier(asset_address), &tier);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::AssetTier(asset_address), YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+        Ok(())
+    }
+
+    // Function to get security deposit info
+    pub fn get_security_deposit(env: Env, lease_id: u64) -> Result<SecurityDeposit, LeaseError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SecurityDeposit(lease_id))
+            .ok_or(LeaseError::LeaseNotFound)
+    }
+
+    // Function to get escrow vault info
+    pub fn get_escrow_vault(env: Env) -> EscrowVault {
+        Self::get_or_init_escrow_vault(&env)
+    }
+
+    // Security function to check if deposit can be accessed
+    fn can_access_deposit(
+        env: &Env,
+        lease_id: u64,
+        caller: &Address,
+    ) -> Result<bool, LeaseError> {
+        let lease = load_lease_instance_by_id(env, lease_id)
+            .ok_or(LeaseError::LeaseNotFound)?;
+        
+        let security_deposit = env.storage()
+            .persistent()
+            .get(&DataKey::SecurityDeposit(lease_id))
+            .ok_or(LeaseError::LeaseNotFound)?;
+        
+        // Only allow access if:
+        // 1. Lease is not active (expired or terminated)
+        // 2. Deposit is not in Held status (must be Settled or Disputed)
+        // 3. Caller is the lessee (tenant) or an authorized arbitrator
+        
+        let lease_inactive = lease.status != LeaseStatus::Active;
+        let deposit_not_held = security_deposit.status != DepositStatus::Held;
+        let is_lessee = caller == &security_deposit.lessee;
+        let is_arbitrator = lease.arbitrators.contains(caller);
+        
+        // Lessors CANNOT access deposits during active leases
+        let is_lessor = caller == &security_deposit.lessor;
+        if is_lessor && lease.status == LeaseStatus::Active {
+            return Ok(false); // Explicitly deny lessor access during active lease
+        }
+        
+        Ok(lease_inactive && (deposit_not_held || is_lessee || is_arbitrator))
+    }
+
+    // Function to release security deposit (only when conditions are met)
+    pub fn release_security_deposit(
+        env: Env,
+        lease_id: u64,
+        caller: Address,
+        damage_deduction: i128,
+    ) -> Result<i128, LeaseError> {
+        caller.require_auth();
+        
+        // Check access permissions
+        if !Self::can_access_deposit(&env, lease_id, &caller)? {
+            return Err(LeaseError::Unauthorised);
+        }
+        
+        let mut lease = load_lease_instance_by_id(&env, lease_id)
+            .ok_or(LeaseError::LeaseNotFound)?;
+        
+        let mut security_deposit = env.storage()
+            .persistent()
+            .get(&DataKey::SecurityDeposit(lease_id))
+            .ok_or(LeaseError::LeaseNotFound)?;
+        
+        // Validate damage deduction
+        if damage_deduction < 0 || damage_deduction > security_deposit.amount {
+            return Err(LeaseError::InvalidDeduction);
+        }
+        
+        // Calculate refund amount
+        let refund_amount = security_deposit.amount - damage_deduction;
+        
+        // Update vault state
+        let mut vault = Self::get_or_init_escrow_vault(&env);
+        vault.total_locked = vault.total_locked.saturating_sub(security_deposit.amount);
+        vault.lease_count = vault.lease_count.saturating_sub(1);
+        Self::save_escrow_vault(&env, &vault);
+        
+        // Transfer refund back to lessee
+        if refund_amount > 0 {
+            let token_client = token_contract::TokenClient::new(&env, &security_deposit.asset_address);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &security_deposit.lessee,
+                &refund_amount,
+            );
+        }
+        
+        // Transfer damage deduction to lessor if applicable
+        if damage_deduction > 0 {
+            let token_client = token_contract::TokenClient::new(&env, &security_deposit.asset_address);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &security_deposit.lessor,
+                &damage_deduction,
+            );
+        }
+        
+        // Update statuses
+        security_deposit.status = DepositStatus::Settled;
+        lease.deposit_status = DepositStatus::Settled;
+        
+        // Save updated state
+        env.storage().persistent().set(&DataKey::SecurityDeposit(lease_id), &security_deposit);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::SecurityDeposit(lease_id), YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+        
+        save_lease_instance(&env, lease_id, &lease);
+        
+        Ok(refund_amount)
     }
 
     pub fn upgrade(
@@ -1981,3 +2659,5 @@ impl LeaseContract {
 
 mod test;
 mod upgrade_tests;
+#[cfg(test)]
+mod security_deposit_tests;

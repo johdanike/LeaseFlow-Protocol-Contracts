@@ -10,6 +10,7 @@ use crate::{
     LeaseStatus, MaintenanceStatus, RateType, SubletStatus, UtilityBillStatus,
     DamageSeverity, OraclePayload,
 };
+use crate::{JUROR_SLASH_AMOUNT, JUROR_VOTE_DEADLINE_HOURS};
 use soroban_sdk::{
     contract, contractclient, contractimpl, symbol_short,
     testutils::{Address as _, Ledger},
@@ -110,24 +111,16 @@ fn make_lease(env: &Env, landlord: &Address, tenant: &Address) -> LeaseInstance 
         withdrawal_address: None,
         rent_withdrawn: 0,
         arbitrators: soroban_sdk::Vec::new(env),
-        // Emergency pause fields
-        paused: false,
-        pause_reason: None,
-        paused_at: None,
-        pause_initiator: None,
-        total_paused_duration: 0,
-        rent_pull_authorized_amount: None,
-        last_rent_pull_timestamp: None,
-        billing_cycle_duration: 2_592_000,
-        // New Features
-        yield_delegation_enabled: false,
-        yield_accumulated: 0,
-        equity_balance: 0,
-        equity_percentage_bps: 0,
-        had_late_payment: false,
-        has_pet: false,
-        pet_deposit_amount: 0,
-        pet_rent_amount: 0,
+        maintenance_status: MaintenanceStatus::None,
+        withheld_rent: 0,
+        repair_proof_hash: None,
+        inspector: None,
+        wear_allowance_bps: 500, // 5% wear allowance
+        asset_lifespan_days: 3650, // 10 years
+        asset_value: 100_000, // Asset value in stroops
+        deposit_timestamp: START,
+        subleasing_allowed: true,
+        master_lease_id: None,
     }
 }
 
