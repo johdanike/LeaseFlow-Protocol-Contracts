@@ -7,13 +7,13 @@
 
 use super::*;
 use crate::{
-    CreateLeaseParams, DataKey, DepositStatus, HistoricalLease, LeaseContract, LeaseContractClient,
-    LeaseStatus, MaintenanceStatus, RateType, DamageSeverity, OraclePayload, LeaseError
+    CreateLeaseParams, DamageSeverity, DataKey, DepositStatus, HistoricalLease, LeaseContract,
+    LeaseContractClient, LeaseError, LeaseStatus, MaintenanceStatus, OraclePayload, RateType,
 };
 use soroban_sdk::{
-    contract, contractclient, contractimpl, symbol_short, vec,
+    contract, contractclient, contractimpl, symbol_short,
     testutils::{Address as _, Events, Ledger},
-    Address, BytesN, Env, String,
+    vec, Address, BytesN, Env, String,
 };
 
 const START: u64 = 1711929600;
@@ -43,17 +43,17 @@ impl YieldMock {
         env.storage().instance().set(&from, &lp_tokens);
         lp_tokens
     }
-    
+
     pub fn withdraw(env: Env, from: Address, lp_tokens: i128) -> i128 {
         let withdrawn = lp_tokens;
         env.storage().instance().remove(&from);
         withdrawn
     }
-    
+
     pub fn get_balance(env: Env, user: Address) -> i128 {
         env.storage().instance().get(&user).unwrap_or(0)
     }
-    
+
     pub fn claim_rewards(env: Env, user: Address) -> i128 {
         1000i128
     }
@@ -178,7 +178,7 @@ fn test_oracle_whitelist_management() {
     client.set_admin(&admin);
 
     client.whitelist_oracle(&admin, &oracle_pubkey);
-    
+
     let is_whitelisted = env.as_contract(&contract_id, || {
         crate::LeaseContract::is_oracle_whitelisted(&env, &oracle_pubkey)
     });
@@ -188,7 +188,7 @@ fn test_oracle_whitelist_management() {
     assert_eq!(result, Err(Ok(LeaseError::Unauthorised)));
 
     client.remove_oracle(&admin, &oracle_pubkey);
-    
+
     let is_whitelisted_after_removal = env.as_contract(&contract_id, || {
         crate::LeaseContract::is_oracle_whitelisted(&env, &oracle_pubkey)
     });
@@ -246,7 +246,7 @@ fn test_execute_deposit_slash_normal_wear_and_tear() {
     let landlord = Address::generate(&env);
     let tenant = Address::generate(&env);
     let oracle_pubkey = BytesN::from_array(&env, &[3; 32]);
-    
+
     client.set_admin(&admin);
     client.whitelist_oracle(&admin, &oracle_pubkey);
 
@@ -278,7 +278,7 @@ fn test_execute_deposit_slash_unauthorized_oracle() {
     let landlord = Address::generate(&env);
     let tenant = Address::generate(&env);
     let unauthorized_oracle = BytesN::from_array(&env, &[4; 32]);
-    
+
     let mut lease = make_lease(&env, &landlord, &tenant);
     lease.status = LeaseStatus::Terminated;
     lease.payment_token = Address::generate(&env);
@@ -305,7 +305,7 @@ fn test_execute_deposit_slash_invalid_nonce() {
     let landlord = Address::generate(&env);
     let tenant = Address::generate(&env);
     let oracle_pubkey = BytesN::from_array(&env, &[5; 32]);
-    
+
     client.set_admin(&admin);
     client.whitelist_oracle(&admin, &oracle_pubkey);
 
@@ -338,7 +338,7 @@ fn test_execute_deposit_slash_lease_not_terminated() {
     let landlord = Address::generate(&env);
     let tenant = Address::generate(&env);
     let oracle_pubkey = BytesN::from_array(&env, &[6; 32]);
-    
+
     client.set_admin(&admin);
     client.whitelist_oracle(&admin, &oracle_pubkey);
 
@@ -366,7 +366,7 @@ fn test_execute_deposit_slash_deposit_already_settled() {
     let landlord = Address::generate(&env);
     let tenant = Address::generate(&env);
     let oracle_pubkey = BytesN::from_array(&env, &[7; 32]);
-    
+
     client.set_admin(&admin);
     client.whitelist_oracle(&admin, &oracle_pubkey);
 
@@ -418,7 +418,7 @@ fn test_signature_timestamp_validation() {
     let landlord = Address::generate(&env);
     let tenant = Address::generate(&env);
     let oracle_pubkey = BytesN::from_array(&env, &[8; 32]);
-    
+
     client.set_admin(&admin);
     client.whitelist_oracle(&admin, &oracle_pubkey);
 
@@ -614,7 +614,7 @@ fn test_reclaim_asset_success() {
 
     let lease = make_lease(&env, &landlord, &tenant);
     seed_lease(&env, &id, LEASE_ID, &lease);
-    
+
     client.reclaim_asset(&LEASE_ID, &landlord, &reason);
 }
 
@@ -841,8 +841,6 @@ impl TokenMock {
     }
 }
 
-
-
 #[test]
 fn test_terminate_lease_bounty_paid() {
     let env = make_env();
@@ -869,7 +867,10 @@ fn test_terminate_lease_bounty_paid() {
 
     let expected_bounty: i128 = 100;
     assert_eq!(token_client.balance(&landlord), expected_bounty);
-    assert_eq!(token_client.balance(&fee_recipient), platform_fee - expected_bounty);
+    assert_eq!(
+        token_client.balance(&fee_recipient),
+        platform_fee - expected_bounty
+    );
     assert!(read_lease(&env, &contract_id, LEASE_ID).is_none());
 }
 
@@ -894,29 +895,41 @@ fn test_terminate_lease_no_bounty_without_platform_fee() {
 fn create_yield_test_env() -> (Env, Address, Address, Address, Address, Address) {
     let env = Env::default();
     env.mock_all_auths();
-    
+
     let admin = Address::generate(&env);
     let landlord = Address::generate(&env);
     let tenant = Address::generate(&env);
     let dao = Address::generate(&env);
-    
+
     let lease_contract_id = env.register(LeaseContract, ());
     let lease_client = LeaseContractClient::new(&env, &lease_contract_id);
-    
+
     let yield_contract_id = env.register(YieldMock, ());
-    
+
     lease_client.set_admin(&admin);
     lease_client.set_platform_fee(&admin, &1000, &Address::generate(&env), &dao);
     lease_client.whitelist_yield_protocol(&admin, &yield_contract_id);
     lease_client.set_liquidity_buffer_amount(&admin, &10000);
-    
-    (env, lease_contract_id, yield_contract_id, admin, landlord, tenant)
+
+    (
+        env,
+        lease_contract_id,
+        yield_contract_id,
+        admin,
+        landlord,
+        tenant,
+    )
 }
 
-fn create_test_lease_for_yield(env: &Env, contract_id: &Address, landlord: Address, tenant: Address) {
+fn create_test_lease_for_yield(
+    env: &Env,
+    contract_id: &Address,
+    landlord: Address,
+    tenant: Address,
+) {
     let lease_client = LeaseContractClient::new(env, contract_id);
     let payment_token = env.register(TokenMock, ()); // Uses registered mock
-    
+
     let params = CreateLeaseParams {
         tenant: tenant.clone(),
         rent_amount: 1000,
@@ -941,77 +954,65 @@ fn create_test_lease_for_yield(env: &Env, contract_id: &Address, landlord: Addre
         max_slippage_bps: 500,
         swap_path: soroban_sdk::Vec::new(env),
     };
-    
+
     lease_client.create_lease_instance(&LEASE_ID, &landlord, &params);
 }
 
 #[test]
 fn test_deploy_escrow_to_yield_success() {
-    let (env, lease_contract_id, yield_contract_id, admin, landlord, tenant) = create_yield_test_env();
-    
+    let (env, lease_contract_id, yield_contract_id, admin, landlord, tenant) =
+        create_yield_test_env();
+
     create_test_lease_for_yield(&env, &lease_contract_id, landlord, tenant);
-    
+
     let lease_client = LeaseContractClient::new(&env, &lease_contract_id);
-    
-    lease_client.deploy_escrow_to_yield(
-        &LEASE_ID,
-        &yield_contract_id,
-        &2000,
-        &500,
-    );
-    
+
+    lease_client.deploy_escrow_to_yield(&LEASE_ID, &yield_contract_id, &2000, &500);
+
     let deployment = lease_client.get_yield_deployment(&LEASE_ID);
     assert_eq!(deployment.lease_id, LEASE_ID);
     assert_eq!(deployment.principal_amount, 2000);
     assert_eq!(deployment.yield_protocol, yield_contract_id);
     assert_eq!(deployment.lp_tokens, 2000);
     assert!(deployment.active);
-    
+
     let lease = lease_client.get_lease_instance(&LEASE_ID);
     assert_eq!(lease.security_deposit, 3000);
 }
 
 #[test]
 fn test_harvest_yield_distribution() {
-    let (env, lease_contract_id, yield_contract_id, admin, landlord, tenant) = create_yield_test_env();
-    
+    let (env, lease_contract_id, yield_contract_id, admin, landlord, tenant) =
+        create_yield_test_env();
+
     create_test_lease_for_yield(&env, &lease_contract_id, landlord, tenant);
-    
+
     let lease_client = LeaseContractClient::new(&env, &lease_contract_id);
-    
-    lease_client.deploy_escrow_to_yield(
-        &LEASE_ID,
-        &yield_contract_id,
-        &2000,
-        &500,
-    );
-    
+
+    lease_client.deploy_escrow_to_yield(&LEASE_ID, &yield_contract_id, &2000, &500);
+
     lease_client.harvest_yield(&LEASE_ID);
-    
+
     let accumulated = lease_client.get_accumulated_yield(&LEASE_ID);
     assert_eq!(accumulated, 1000); // Verify the harvest worked securely without checking events
 }
 
 #[test]
 fn test_withdraw_from_yield_success() {
-    let (env, lease_contract_id, yield_contract_id, admin, landlord, tenant) = create_yield_test_env();
-    
+    let (env, lease_contract_id, yield_contract_id, admin, landlord, tenant) =
+        create_yield_test_env();
+
     create_test_lease_for_yield(&env, &lease_contract_id, landlord, tenant);
-    
+
     let lease_client = LeaseContractClient::new(&env, &lease_contract_id);
-    
-    lease_client.deploy_escrow_to_yield(
-        &LEASE_ID,
-        &yield_contract_id,
-        &2000,
-        &500,
-    );
-    
+
+    lease_client.deploy_escrow_to_yield(&LEASE_ID, &yield_contract_id, &2000, &500);
+
     lease_client.withdraw_from_yield(&LEASE_ID, &500);
-    
+
     let lease = lease_client.get_lease_instance(&LEASE_ID);
     assert_eq!(lease.security_deposit, 5000); // Back to original
-    
+
     let deployment = lease_client.get_yield_deployment(&LEASE_ID);
     assert!(!deployment.active);
     assert_eq!(deployment.lp_tokens, 0);
@@ -1056,9 +1057,9 @@ fn test_add_authorized_roommate_success() {
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
-    
+
     client.add_authorized_payer(&LEASE_ID, &landlord, &roommate);
-    
+
     let stranger = Address::generate(&env);
     let result = client.try_add_authorized_payer(&LEASE_ID, &stranger, &roommate);
     assert_eq!(result, Err(Ok(LeaseError::Unauthorised)));
@@ -1071,7 +1072,7 @@ fn test_roommate_split_payment_execution() {
     let landlord = Address::generate(&env);
     let primary_tenant = Address::generate(&env);
     let roommate = Address::generate(&env);
-    
+
     let token_id = env.register(TokenMock, ());
     let token_client = TokenMockClient::new(&env, &token_id);
     token_client.mint(&roommate, &5000);
